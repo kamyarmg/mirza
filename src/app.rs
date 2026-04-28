@@ -477,17 +477,105 @@ impl StatusCodeExt for StatusCode {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::path::PathBuf;
+    use std::thread;
+    use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
+
+    fn unique_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("mirza-{name}-{}-{stamp}", std::process::id()));
+        path
+    }
+
+    fn spawn_server(response: &'static str) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        (format!("http://{address}"), handle)
+    }
+
+    fn spawn_timeout_server() -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(StdDuration::from_millis(200));
+        });
+
+        (format!("http://{address}"), handle)
+    }
+
+    fn ok_response() -> &'static str {
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Test: yes\r\nConnection: close\r\n\r\nok"
+    }
 
     #[test]
-    fn infer_post_when_data_exists() {
+    fn run_returns_error_when_url_is_missing() {
+        let cli = Cli::parse_from(["mirza"]);
+        assert_eq!(run(&cli).unwrap_err().code(), 2);
+    }
+
+    #[test]
+    fn run_writes_response_body_to_output_file() {
+        let (url, handle) = spawn_server(ok_response());
+        let output_path = unique_path("run-output");
+        let cli = Cli::parse_from(["mirza", "-o", output_path.to_str().unwrap(), url.as_str()]);
+        run(&cli).unwrap();
+        handle.join().unwrap();
+        let written = fs::read(&output_path).unwrap();
+        fs::remove_file(&output_path).unwrap();
+        assert_eq!(written, b"ok");
+    }
+
+    #[test]
+    fn validate_cli_rejects_multiple_payload_modes() {
+        let cli = Cli::parse_from(["mirza", "-d", "a=1", "--json", "{}", "https://example.com"]);
+        assert_eq!(validate_cli(&cli).unwrap_err().code(), 2);
+    }
+
+    #[test]
+    fn infer_method_returns_post_when_data_exists() {
         let cli = Cli::parse_from(["mirza", "-d", "a=1", "https://example.com"]);
         assert_eq!(infer_method(&cli).unwrap(), Method::POST);
     }
 
     #[test]
-    fn infer_put_for_upload() {
+    fn infer_method_returns_put_for_upload() {
         let cli = Cli::parse_from(["mirza", "-T", "payload.txt", "https://example.com"]);
         assert_eq!(infer_method(&cli).unwrap(), Method::PUT);
+    }
+
+    #[test]
+    fn infer_method_returns_custom_method_when_requested() {
+        let cli = Cli::parse_from(["mirza", "-X", "PATCH", "https://example.com"]);
+        assert_eq!(infer_method(&cli).unwrap(), Method::PATCH);
+    }
+
+    #[test]
+    fn infer_method_returns_head_for_head_flag() {
+        let cli = Cli::parse_from(["mirza", "-I", "https://example.com"]);
+        assert_eq!(infer_method(&cli).unwrap(), Method::HEAD);
+    }
+
+    #[test]
+    fn infer_method_returns_get_for_get_flag() {
+        let cli = Cli::parse_from(["mirza", "-G", "https://example.com"]);
+        assert_eq!(infer_method(&cli).unwrap(), Method::GET);
     }
 
     #[test]
@@ -497,8 +585,238 @@ mod tests {
     }
 
     #[test]
+    fn parse_url_rejects_invalid_url() {
+        assert!(parse_url("://bad url").is_err());
+    }
+
+    #[test]
+    fn append_query_string_sets_missing_query() {
+        let mut url = Url::parse("https://example.com").unwrap();
+        append_query_string(&mut url, "a=1");
+        assert_eq!(url.query(), Some("a=1"));
+    }
+
+    #[test]
+    fn append_query_string_appends_existing_query() {
+        let mut url = Url::parse("https://example.com?x=1").unwrap();
+        append_query_string(&mut url, "a=1");
+        assert_eq!(url.query(), Some("x=1&a=1"));
+    }
+
+    #[test]
+    fn build_client_accepts_default_configuration() {
+        let cli = Cli::parse_from(["mirza", "https://example.com"]);
+        assert!(build_client(&cli).is_ok());
+    }
+
+    #[test]
+    fn build_client_rejects_invalid_proxy() {
+        let cli = Cli::parse_from(["mirza", "-x", "://bad-proxy", "https://example.com"]);
+        assert_eq!(build_client(&cli).unwrap_err().code(), 5);
+    }
+
+    #[test]
+    fn duration_from_secs_converts_positive_values() {
+        assert_eq!(
+            duration_from_secs(1.5).unwrap(),
+            StdDuration::from_millis(1500)
+        );
+    }
+
+    #[test]
+    fn duration_from_secs_rejects_negative_values() {
+        assert_eq!(duration_from_secs(-1.0).unwrap_err().code(), 2);
+    }
+
+    #[test]
+    fn build_headers_includes_custom_header() {
+        let cli = Cli::parse_from(["mirza", "-H", "x-test: 1", "https://example.com"]);
+        let headers = build_headers(&cli).unwrap();
+        assert_eq!(headers.get("x-test").unwrap(), "1");
+    }
+
+    #[test]
+    fn build_headers_adds_json_content_type() {
+        let cli = Cli::parse_from(["mirza", "--json", "{}", "https://example.com"]);
+        let headers = build_headers(&cli).unwrap();
+        assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "application/json");
+    }
+
+    #[test]
+    fn build_headers_adds_form_content_type_for_data() {
+        let cli = Cli::parse_from(["mirza", "-d", "a=1", "https://example.com"]);
+        let headers = build_headers(&cli).unwrap();
+        assert_eq!(
+            headers.get(CONTENT_TYPE).unwrap(),
+            "application/x-www-form-urlencoded"
+        );
+    }
+
+    #[test]
+    fn parse_user_password_splits_password() {
+        assert_eq!(
+            parse_user_password(Some("kami:secret")),
+            Some(("kami".to_string(), Some("secret".to_string())))
+        );
+    }
+
+    #[test]
+    fn parse_user_password_keeps_missing_password_empty() {
+        assert_eq!(
+            parse_user_password(Some("kami")),
+            Some(("kami".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn build_request_body_returns_none_without_data() {
+        let cli = Cli::parse_from(["mirza", "https://example.com"]);
+        assert_eq!(build_request_body(&cli).unwrap(), None);
+    }
+
+    #[test]
+    fn build_request_body_joins_segments() {
+        let cli = Cli::parse_from(["mirza", "-d", "a=1", "-d", "b=2", "https://example.com"]);
+        assert_eq!(build_request_body(&cli).unwrap(), Some(b"a=1&b=2".to_vec()));
+    }
+
+    #[test]
+    fn build_query_string_returns_request_body_text() {
+        let cli = Cli::parse_from(["mirza", "-d", "a=1", "https://example.com"]);
+        assert_eq!(build_query_string(&cli).unwrap(), Some("a=1".to_string()));
+    }
+
+    #[test]
+    fn read_data_segment_returns_literal_bytes() {
+        assert_eq!(
+            read_data_segment("plain", false).unwrap(),
+            b"plain".to_vec()
+        );
+    }
+
+    #[test]
+    fn read_data_segment_reads_file_reference() {
+        let path = unique_path("data-segment");
+        fs::write(&path, b"file-body").unwrap();
+        let token = format!("@{}", path.display());
+        let bytes = read_data_segment(&token, true).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(bytes, b"file-body".to_vec());
+    }
+
+    #[test]
     fn join_segments_uses_ampersand() {
         let joined = join_segments(&[b"a=1".to_vec(), b"b=2".to_vec()]);
         assert_eq!(joined, b"a=1&b=2");
+    }
+
+    #[test]
+    fn build_form_accepts_text_field() {
+        assert!(build_form(&["name=value".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn build_form_rejects_field_without_separator() {
+        assert_eq!(build_form(&["broken".to_string()]).unwrap_err().code(), 2);
+    }
+
+    #[test]
+    fn build_file_part_accepts_existing_file() {
+        let path = unique_path("part-file");
+        fs::write(&path, b"payload").unwrap();
+        let part = build_file_part(path.to_str().unwrap());
+        fs::remove_file(&path).unwrap();
+        assert!(part.is_ok());
+    }
+
+    #[test]
+    fn build_file_part_rejects_invalid_mime() {
+        let path = unique_path("part-mime");
+        fs::write(&path, b"payload").unwrap();
+        let spec = format!("{};type=bad mime", path.display());
+        let error = build_file_part(&spec).unwrap_err();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(error.code(), 2);
+    }
+
+    #[test]
+    fn render_response_headers_contains_status_line() {
+        let (url, handle) = spawn_server(ok_response());
+        let response = reqwest::blocking::get(url).unwrap();
+        let rendered = render_response_headers(&response);
+        handle.join().unwrap();
+        assert!(
+            String::from_utf8(rendered)
+                .unwrap()
+                .starts_with("HTTP/1.1 200 OK\r\n")
+        );
+    }
+
+    #[test]
+    fn print_request_trace_does_not_panic() {
+        let request = Client::new()
+            .request(Method::GET, "https://example.com")
+            .build()
+            .unwrap();
+        assert!(catch_unwind(AssertUnwindSafe(|| print_request_trace(&request))).is_ok());
+    }
+
+    #[test]
+    fn print_response_trace_does_not_panic() {
+        let (url, handle) = spawn_server(ok_response());
+        let response = reqwest::blocking::get(url).unwrap();
+        let result = catch_unwind(AssertUnwindSafe(|| print_response_trace(&response)));
+        handle.join().unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn version_string_returns_http11_name() {
+        assert_eq!(version_string(Version::HTTP_11), "HTTP/1.1");
+    }
+
+    #[test]
+    fn map_request_error_maps_builder_errors_to_code_three() {
+        let error = Client::new()
+            .request(Method::GET, "http://[::1")
+            .build()
+            .unwrap_err();
+        assert_eq!(map_request_error(error).code(), 3);
+    }
+
+    #[test]
+    fn map_request_error_maps_connect_errors_to_code_seven() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .unwrap_err();
+        assert_eq!(map_request_error(error).code(), 7);
+    }
+
+    #[test]
+    fn map_request_error_maps_timeouts_to_code_twenty_eight() {
+        let (url, handle) = spawn_timeout_server();
+        let error = Client::builder()
+            .timeout(StdDuration::from_millis(50))
+            .build()
+            .unwrap()
+            .get(url)
+            .send()
+            .unwrap_err();
+        handle.join().unwrap();
+        assert_eq!(map_request_error(error).code(), 28);
+    }
+
+    #[test]
+    fn status_code_ext_returns_true_for_client_errors() {
+        assert!(StatusCode::BAD_REQUEST.is_client_error_or_server_error());
+    }
+
+    #[test]
+    fn status_code_ext_returns_false_for_success_status() {
+        assert!(!StatusCode::OK.is_client_error_or_server_error());
     }
 }

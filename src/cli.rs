@@ -91,3 +91,38 @@ pub struct Cli {
     #[arg(long = "http2", conflicts_with = "http1_1")]
     pub http2: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_sets_url() {
+        let cli = Cli::parse_from(["mirza", "https://example.com"]);
+        assert_eq!(cli.url.as_deref(), Some("https://example.com"));
+    }
+
+    #[test]
+    fn parse_collects_headers() {
+        let cli = Cli::parse_from([
+            "mirza",
+            "-H",
+            "x-one: 1",
+            "-H",
+            "x-two: 2",
+            "https://example.com",
+        ]);
+        assert_eq!(cli.headers, vec!["x-one: 1", "x-two: 2"]);
+    }
+
+    #[test]
+    fn parse_rejects_conflicting_http_flags() {
+        assert!(Cli::try_parse_from([
+            "mirza",
+            "--http1.1",
+            "--http2",
+            "https://example.com",
+        ])
+        .is_err());
+    }
+}

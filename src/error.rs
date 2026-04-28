@@ -20,3 +20,20 @@ impl AppError {
         &self.message
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn code_returns_constructor_code() {
+        let error = AppError::new(12, "boom");
+        assert_eq!(error.code(), 12);
+    }
+
+    #[test]
+    fn message_returns_constructor_message() {
+        let error = AppError::new(12, "boom");
+        assert_eq!(error.message(), "boom");
+    }
+}
