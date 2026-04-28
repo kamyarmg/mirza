@@ -22,10 +22,10 @@ pub fn run(cli: &Cli) -> Result<i32, AppError> {
         .ok_or_else(|| AppError::new(2, "missing URL"))?;
 
     let mut url = parse_url(url_input)?;
-    if cli.get {
-        if let Some(query) = build_query_string(cli)? {
-            append_query_string(&mut url, &query);
-        }
+    if cli.get
+        && let Some(query) = build_query_string(cli)?
+    {
+        append_query_string(&mut url, &query);
     }
 
     let method = infer_method(cli)?;
@@ -50,10 +50,10 @@ pub fn run(cli: &Cli) -> Result<i32, AppError> {
         request_builder = request_builder.body(read_input_bytes(upload_path)?);
     } else if let Some(json_body) = &cli.json {
         request_builder = request_builder.body(json_body.clone());
-    } else if !cli.get {
-        if let Some(body) = build_request_body(cli)? {
-            request_builder = request_builder.body(body);
-        }
+    } else if !cli.get
+        && let Some(body) = build_request_body(cli)?
+    {
+        request_builder = request_builder.body(body);
     }
 
     let request = request_builder
@@ -70,7 +70,7 @@ pub fn run(cli: &Cli) -> Result<i32, AppError> {
         print_response_trace(&response);
     }
 
-    if cli.fail && response.status().is_client_error_or_server_error() {
+    if cli.fail && response.status().has_client_or_server_error() {
         return Err(AppError::new(
             22,
             format!("request failed with status {}", response.status()),
@@ -308,10 +308,8 @@ fn build_query_string(cli: &Cli) -> Result<Option<String>, AppError> {
 }
 
 fn read_data_segment(value: &str, allow_file_reference: bool) -> Result<Vec<u8>, AppError> {
-    if allow_file_reference {
-        if let Some(path) = value.strip_prefix('@') {
-            return read_input_bytes(Path::new(path));
-        }
+    if allow_file_reference && let Some(path) = value.strip_prefix('@') {
+        return read_input_bytes(Path::new(path));
     }
 
     Ok(value.as_bytes().to_vec())
@@ -464,11 +462,11 @@ fn map_request_error(error: reqwest::Error) -> AppError {
 }
 
 trait StatusCodeExt {
-    fn is_client_error_or_server_error(self) -> bool;
+    fn has_client_or_server_error(self) -> bool;
 }
 
 impl StatusCodeExt for StatusCode {
-    fn is_client_error_or_server_error(self) -> bool {
+    fn has_client_or_server_error(self) -> bool {
         self.is_client_error() || self.is_server_error()
     }
 }
@@ -812,11 +810,11 @@ mod tests {
 
     #[test]
     fn status_code_ext_returns_true_for_client_errors() {
-        assert!(StatusCode::BAD_REQUEST.is_client_error_or_server_error());
+        assert!(StatusCode::BAD_REQUEST.has_client_or_server_error());
     }
 
     #[test]
     fn status_code_ext_returns_false_for_success_status() {
-        assert!(!StatusCode::OK.is_client_error_or_server_error());
+        assert!(!StatusCode::OK.has_client_or_server_error());
     }
 }
