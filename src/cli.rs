@@ -142,14 +142,7 @@ mod tests {
 
     #[test]
     fn parse_sets_continue_at() {
-        let cli = Cli::parse_from([
-            "mirza",
-            "-C",
-            "-",
-            "-o",
-            "out.bin",
-            "https://example.com",
-        ]);
+        let cli = Cli::parse_from(["mirza", "-C", "-", "-o", "out.bin", "https://example.com"]);
         assert_eq!(cli.continue_at.as_deref(), Some("-"));
     }
 }

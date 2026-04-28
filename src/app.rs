@@ -280,8 +280,9 @@ fn build_headers(cli: &Cli, resume_offset: Option<u64>) -> Result<HeaderMap, App
     if let Some(range) = build_range_header_value(cli, resume_offset) {
         headers.insert(
             RANGE,
-            HeaderValue::from_str(&range)
-                .map_err(|error| AppError::new(2, format!("invalid range value '{range}': {error}")))?,
+            HeaderValue::from_str(&range).map_err(|error| {
+                AppError::new(2, format!("invalid range value '{range}': {error}"))
+            })?,
         );
     }
 
@@ -371,12 +372,18 @@ fn parse_rate_limit(value: Option<&str>) -> Result<Option<u64>, AppError> {
 
     let digits_len = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
     if digits_len == 0 {
-        return Err(AppError::new(2, format!("invalid --limit-rate value '{trimmed}'")));
+        return Err(AppError::new(
+            2,
+            format!("invalid --limit-rate value '{trimmed}'"),
+        ));
     }
 
-    let number = trimmed[..digits_len]
-        .parse::<u64>()
-        .map_err(|error| AppError::new(2, format!("invalid --limit-rate value '{trimmed}': {error}")))?;
+    let number = trimmed[..digits_len].parse::<u64>().map_err(|error| {
+        AppError::new(
+            2,
+            format!("invalid --limit-rate value '{trimmed}': {error}"),
+        )
+    })?;
 
     let suffix = trimmed[digits_len..].to_ascii_lowercase();
     let multiplier = match suffix.as_str() {
@@ -396,9 +403,7 @@ fn parse_rate_limit(value: Option<&str>) -> Result<Option<u64>, AppError> {
 }
 
 fn read_data_segment(value: &str, allow_file_reference: bool) -> Result<Vec<u8>, AppError> {
-    if allow_file_reference
-        && let Some(path) = value.strip_prefix('@')
-    {
+    if allow_file_reference && let Some(path) = value.strip_prefix('@') {
         return read_input_bytes(Path::new(path));
     }
 
@@ -479,7 +484,9 @@ fn build_request(
     url: &Url,
     headers: &HeaderMap,
 ) -> Result<Request, AppError> {
-    let mut request_builder = client.request(method.clone(), url.clone()).headers(headers.clone());
+    let mut request_builder = client
+        .request(method.clone(), url.clone())
+        .headers(headers.clone());
 
     if cli.http1_1 {
         request_builder = request_builder.version(Version::HTTP_11);
@@ -944,7 +951,10 @@ mod tests {
 
     #[test]
     fn duration_from_secs_converts_positive_values() {
-        assert_eq!(duration_from_secs(1.5).unwrap(), StdDuration::from_millis(1500));
+        assert_eq!(
+            duration_from_secs(1.5).unwrap(),
+            StdDuration::from_millis(1500)
+        );
     }
 
     #[test]
@@ -970,7 +980,10 @@ mod tests {
     fn build_headers_adds_form_content_type_for_data() {
         let cli = Cli::parse_from(["mirza", "-d", "a=1", "https://example.com"]);
         let headers = build_headers(&cli, None).unwrap();
-        assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "application/x-www-form-urlencoded");
+        assert_eq!(
+            headers.get(CONTENT_TYPE).unwrap(),
+            "application/x-www-form-urlencoded"
+        );
     }
 
     #[test]
@@ -989,14 +1002,7 @@ mod tests {
 
     #[test]
     fn resolve_resume_offset_uses_explicit_value() {
-        let cli = Cli::parse_from([
-            "mirza",
-            "-C",
-            "12",
-            "-o",
-            "file.txt",
-            "https://example.com",
-        ]);
+        let cli = Cli::parse_from(["mirza", "-C", "12", "-o", "file.txt", "https://example.com"]);
         assert_eq!(resolve_resume_offset(&cli).unwrap(), Some(12));
     }
 
@@ -1063,7 +1069,10 @@ mod tests {
 
     #[test]
     fn read_data_segment_returns_literal_bytes() {
-        assert_eq!(read_data_segment("plain", false).unwrap(), b"plain".to_vec());
+        assert_eq!(
+            read_data_segment("plain", false).unwrap(),
+            b"plain".to_vec()
+        );
     }
 
     #[test]
@@ -1133,7 +1142,11 @@ mod tests {
         let response = reqwest::blocking::get(url).unwrap();
         let rendered = render_response_headers(&response);
         handle.join().unwrap();
-        assert!(String::from_utf8(rendered).unwrap().starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(
+            String::from_utf8(rendered)
+                .unwrap()
+                .starts_with("HTTP/1.1 200 OK\r\n")
+        );
     }
 
     #[test]
