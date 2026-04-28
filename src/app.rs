@@ -25,6 +25,8 @@ struct ResponseSummary {
 
 struct RenderedOutput {
     body: Vec<u8>,
+    raw_body: Vec<u8>,
+    summary: ResponseSummary,
 }
 
 struct DisplayOptions {
@@ -38,6 +40,22 @@ struct DisplaySections {
     meta: bool,
     headers: bool,
     body: bool,
+}
+
+pub struct CapturedResponse {
+    pub method: String,
+    pub url: String,
+    pub status: u16,
+    pub reason: String,
+    pub version: String,
+    pub headers: Vec<(String, String)>,
+    pub header_block: Vec<u8>,
+    pub body: Vec<u8>,
+    pub rendered: Vec<u8>,
+    pub duration: Duration,
+    pub body_bytes: u64,
+    pub content_type: Option<String>,
+    pub certificate_summary: Option<String>,
 }
 
 pub fn run(cli: &Cli) -> Result<i32, AppError> {
@@ -122,6 +140,97 @@ pub fn run(cli: &Cli) -> Result<i32, AppError> {
     }
 
     Ok(0)
+}
+
+pub fn execute_capture(cli: &Cli) -> Result<CapturedResponse, AppError> {
+    validate_cli(cli)?;
+
+    let url_input = cli
+        .url
+        .as_deref()
+        .ok_or_else(|| AppError::new(2, "missing URL"))?;
+
+    let mut url = parse_url(url_input)?;
+    if cli.get
+        && let Some(query) = build_query_string(cli)?
+    {
+        append_query_string(&mut url, &query);
+    }
+
+    let method = infer_method(cli)?;
+    let resume_offset = resolve_resume_offset(cli)?;
+    let headers = build_headers(cli, resume_offset)?;
+    let client = build_client(cli)?;
+    let started_at = Instant::now();
+    let mut response = execute_with_retry(cli, &client, &method, &url, &headers)?;
+
+    if cli.fail && response.status().has_client_or_server_error() {
+        return Err(AppError::new(
+            22,
+            format!("request failed with status {}", response.status()),
+        ));
+    }
+
+    if resume_offset.unwrap_or(0) > 0 && response.status() != StatusCode::PARTIAL_CONTENT {
+        return Err(AppError::new(
+            33,
+            format!("server did not honor resume request: {}", response.status()),
+        ));
+    }
+
+    let header_block = render_response_headers(&response);
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
+    let header_pairs = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let display_options = display_options(cli);
+    let rendered = render_response_output(
+        cli,
+        &method,
+        &url,
+        &mut response,
+        &header_block,
+        started_at.elapsed(),
+        &display_options,
+    )?;
+
+    Ok(CapturedResponse {
+        method: method.as_str().to_owned(),
+        url: url.as_str().to_owned(),
+        status: response.status().as_u16(),
+        reason: response
+            .status()
+            .canonical_reason()
+            .unwrap_or("")
+            .to_owned(),
+        version: version_string(response.version()).to_owned(),
+        headers: header_pairs,
+        header_block,
+        body: rendered.raw_body,
+        rendered: rendered.body,
+        duration: rendered.summary.total_duration,
+        body_bytes: rendered.summary.body_bytes,
+        content_type,
+        certificate_summary: if url.scheme().eq_ignore_ascii_case("https") {
+            Some(
+                "TLS certificate details are unavailable via the current reqwest backend"
+                    .to_owned(),
+            )
+        } else {
+            None
+        },
+    })
 }
 
 fn should_render_response(cli: &Cli, options: &DisplayOptions) -> bool {
@@ -244,7 +353,11 @@ fn render_response_output(
         OutputStyle::Raw => body.clone(),
     };
 
-    Ok(RenderedOutput { body: rendered })
+    Ok(RenderedOutput {
+        body: rendered,
+        raw_body: body,
+        summary,
+    })
 }
 
 fn render_pretty_response(

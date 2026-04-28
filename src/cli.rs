@@ -31,6 +31,9 @@ pub struct Cli {
     #[arg(value_name = "URL")]
     pub url: Option<String>,
 
+    #[arg(long = "interactive", visible_alias = "inteactive", action = ArgAction::SetTrue)]
+    pub interactive: bool,
+
     #[arg(short = 'X', long = "request")]
     pub request: Option<String>,
 
@@ -145,6 +148,13 @@ mod tests {
     fn parse_sets_url() {
         let cli = Cli::parse_from(["mirza", "https://example.com"]);
         assert_eq!(cli.url.as_deref(), Some("https://example.com"));
+        assert!(!cli.interactive);
+    }
+
+    #[test]
+    fn parse_sets_interactive_mode() {
+        let cli = Cli::parse_from(["mirza", "--interactive"]);
+        assert!(cli.interactive);
     }
 
     #[test]

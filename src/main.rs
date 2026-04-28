@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod error;
+mod interactive;
 mod io_support;
 
 use clap::Parser;
@@ -11,6 +12,10 @@ use std::process::exit;
 fn main() {
     let cli = Cli::parse();
     let should_print_errors = !cli.silent || cli.show_error;
+
+    if cli.interactive || cli.url.is_none() {
+        exit(exit_code_for(interactive::run(cli), false));
+    }
 
     exit(exit_code_for(app::run(&cli), should_print_errors));
 }
