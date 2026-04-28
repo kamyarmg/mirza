@@ -2,15 +2,19 @@ use crate::cli::Cli;
 use crate::error::AppError;
 use crate::io_support::{create_output_writer, read_input_bytes, write_all_to_path};
 use reqwest::blocking::multipart::{Form, Part};
-use reqwest::blocking::{Client, Request};
+use reqwest::blocking::{Client, Request, Response};
 use reqwest::header::{
-    ACCEPT, ACCEPT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, REFERER, USER_AGENT,
+    ACCEPT, ACCEPT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RANGE, REFERER,
+    USER_AGENT,
 };
 use reqwest::redirect::Policy;
 use reqwest::{Method, Proxy, StatusCode, Version};
-use std::io::{self, Write};
+use std::fs;
+use std::fs::OpenOptions;
+use std::io::{self, Read, Write};
 use std::path::Path;
-use std::time::Duration;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 use url::Url;
 
 pub fn run(cli: &Cli) -> Result<i32, AppError> {
@@ -29,46 +33,10 @@ pub fn run(cli: &Cli) -> Result<i32, AppError> {
     }
 
     let method = infer_method(cli)?;
-    let headers = build_headers(cli)?;
+    let resume_offset = resolve_resume_offset(cli)?;
+    let headers = build_headers(cli, resume_offset)?;
     let client = build_client(cli)?;
-    let mut request_builder = client.request(method.clone(), url).headers(headers);
-
-    if cli.http1_1 {
-        request_builder = request_builder.version(Version::HTTP_11);
-    }
-    if cli.http2 {
-        request_builder = request_builder.version(Version::HTTP_2);
-    }
-
-    if let Some((username, password)) = parse_user_password(cli.user.as_deref()) {
-        request_builder = request_builder.basic_auth(username, password);
-    }
-
-    if !cli.form.is_empty() {
-        request_builder = request_builder.multipart(build_form(&cli.form)?);
-    } else if let Some(upload_path) = &cli.upload_file {
-        request_builder = request_builder.body(read_input_bytes(upload_path)?);
-    } else if let Some(json_body) = &cli.json {
-        request_builder = request_builder.body(json_body.clone());
-    } else if !cli.get
-        && let Some(body) = build_request_body(cli)?
-    {
-        request_builder = request_builder.body(body);
-    }
-
-    let request = request_builder
-        .build()
-        .map_err(|error| AppError::new(3, format!("failed to build request: {error}")))?;
-
-    if cli.verbose {
-        print_request_trace(&request);
-    }
-
-    let mut response = client.execute(request).map_err(map_request_error)?;
-
-    if cli.verbose {
-        print_response_trace(&response);
-    }
+    let mut response = execute_with_retry(cli, &client, &method, &url, &headers)?;
 
     if cli.fail && response.status().has_client_or_server_error() {
         return Err(AppError::new(
@@ -77,12 +45,19 @@ pub fn run(cli: &Cli) -> Result<i32, AppError> {
         ));
     }
 
+    if resume_offset.unwrap_or(0) > 0 && response.status() != StatusCode::PARTIAL_CONTENT {
+        return Err(AppError::new(
+            33,
+            format!("server did not honor resume request: {}", response.status()),
+        ));
+    }
+
     let header_block = render_response_headers(&response);
     if let Some(path) = &cli.dump_header {
         write_all_to_path(path, &header_block)?;
     }
 
-    let mut output = create_output_writer(cli.output.as_deref())?;
+    let mut output = create_response_writer(cli.output.as_deref(), resume_offset.unwrap_or(0) > 0)?;
     if cli.include {
         output.write_all(&header_block).map_err(|error| {
             AppError::new(23, format!("failed to write response headers: {error}"))
@@ -90,7 +65,8 @@ pub fn run(cli: &Cli) -> Result<i32, AppError> {
     }
 
     if method != Method::HEAD {
-        io::copy(&mut response, &mut output).map_err(|error| {
+        let limit_rate = parse_rate_limit(cli.limit_rate.as_deref())?;
+        copy_response_body(&mut response, &mut output, limit_rate).map_err(|error| {
             AppError::new(23, format!("failed to write response body: {error}"))
         })?;
         output
@@ -120,6 +96,37 @@ fn validate_cli(cli: &Cli) -> Result<(), AppError> {
         return Err(AppError::new(
             2,
             "choose only one payload mode among data, json, form, or upload-file",
+        ));
+    }
+
+    if cli.continue_at.is_some() && cli.range.is_some() {
+        return Err(AppError::new(
+            2,
+            "--continue-at cannot be used together with --range",
+        ));
+    }
+
+    if cli.continue_at.is_some() && cli.upload_file.is_some() {
+        return Err(AppError::new(
+            2,
+            "--continue-at is only supported for downloads",
+        ));
+    }
+
+    if cli.continue_at.is_some() && cli.output.is_none() {
+        return Err(AppError::new(
+            2,
+            "--continue-at requires --output with a file path",
+        ));
+    }
+
+    if let Some(output) = cli.output.as_deref()
+        && output.as_os_str() == "-"
+        && cli.continue_at.is_some()
+    {
+        return Err(AppError::new(
+            2,
+            "--continue-at requires --output with a file path",
         ));
     }
 
@@ -212,7 +219,7 @@ fn duration_from_secs(value: f64) -> Result<Duration, AppError> {
     Ok(Duration::from_secs_f64(value))
 }
 
-fn build_headers(cli: &Cli) -> Result<HeaderMap, AppError> {
+fn build_headers(cli: &Cli, resume_offset: Option<u64>) -> Result<HeaderMap, AppError> {
     let mut headers = HeaderMap::new();
 
     for raw in &cli.headers {
@@ -270,7 +277,52 @@ fn build_headers(cli: &Cli) -> Result<HeaderMap, AppError> {
         );
     }
 
+    if let Some(range) = build_range_header_value(cli, resume_offset) {
+        headers.insert(
+            RANGE,
+            HeaderValue::from_str(&range)
+                .map_err(|error| AppError::new(2, format!("invalid range value '{range}': {error}")))?,
+        );
+    }
+
     Ok(headers)
+}
+
+fn build_range_header_value(cli: &Cli, resume_offset: Option<u64>) -> Option<String> {
+    if let Some(offset) = resume_offset.filter(|offset| *offset > 0) {
+        return Some(format!("bytes={offset}-"));
+    }
+
+    cli.range.clone()
+}
+
+fn resolve_resume_offset(cli: &Cli) -> Result<Option<u64>, AppError> {
+    let Some(continue_at) = cli.continue_at.as_deref() else {
+        return Ok(None);
+    };
+
+    let output_path = cli
+        .output
+        .as_deref()
+        .ok_or_else(|| AppError::new(2, "--continue-at requires --output with a file path"))?;
+
+    if continue_at == "-" {
+        return match fs::metadata(output_path) {
+            Ok(metadata) => Ok(Some(metadata.len())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Some(0)),
+            Err(error) => Err(AppError::new(
+                23,
+                format!("failed to inspect '{}': {error}", output_path.display()),
+            )),
+        };
+    }
+
+    continue_at.parse::<u64>().map(Some).map_err(|error| {
+        AppError::new(
+            2,
+            format!("invalid continue offset '{continue_at}': {error}"),
+        )
+    })
 }
 
 fn parse_user_password(input: Option<&str>) -> Option<(String, Option<String>)> {
@@ -307,8 +359,46 @@ fn build_query_string(cli: &Cli) -> Result<Option<String>, AppError> {
     Ok(body.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
 }
 
+fn parse_rate_limit(value: Option<&str>) -> Result<Option<u64>, AppError> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::new(2, "invalid --limit-rate value"));
+    }
+
+    let digits_len = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digits_len == 0 {
+        return Err(AppError::new(2, format!("invalid --limit-rate value '{trimmed}'")));
+    }
+
+    let number = trimmed[..digits_len]
+        .parse::<u64>()
+        .map_err(|error| AppError::new(2, format!("invalid --limit-rate value '{trimmed}': {error}")))?;
+
+    let suffix = trimmed[digits_len..].to_ascii_lowercase();
+    let multiplier = match suffix.as_str() {
+        "" => 1,
+        "k" => 1024,
+        "m" => 1024 * 1024,
+        "g" => 1024 * 1024 * 1024,
+        _ => {
+            return Err(AppError::new(
+                2,
+                format!("invalid --limit-rate suffix '{suffix}'"),
+            ));
+        }
+    };
+
+    Ok(Some(number.saturating_mul(multiplier)))
+}
+
 fn read_data_segment(value: &str, allow_file_reference: bool) -> Result<Vec<u8>, AppError> {
-    if allow_file_reference && let Some(path) = value.strip_prefix('@') {
+    if allow_file_reference
+        && let Some(path) = value.strip_prefix('@')
+    {
         return read_input_bytes(Path::new(path));
     }
 
@@ -382,13 +472,167 @@ fn build_file_part(raw: &str) -> Result<Part, AppError> {
     }
 }
 
+fn build_request(
+    cli: &Cli,
+    client: &Client,
+    method: &Method,
+    url: &Url,
+    headers: &HeaderMap,
+) -> Result<Request, AppError> {
+    let mut request_builder = client.request(method.clone(), url.clone()).headers(headers.clone());
+
+    if cli.http1_1 {
+        request_builder = request_builder.version(Version::HTTP_11);
+    }
+    if cli.http2 {
+        request_builder = request_builder.version(Version::HTTP_2);
+    }
+
+    if let Some((username, password)) = parse_user_password(cli.user.as_deref()) {
+        request_builder = request_builder.basic_auth(username, password);
+    }
+
+    if !cli.form.is_empty() {
+        request_builder = request_builder.multipart(build_form(&cli.form)?);
+    } else if let Some(upload_path) = &cli.upload_file {
+        request_builder = request_builder.body(read_input_bytes(upload_path)?);
+    } else if let Some(json_body) = &cli.json {
+        request_builder = request_builder.body(json_body.clone());
+    } else if !cli.get
+        && let Some(body) = build_request_body(cli)?
+    {
+        request_builder = request_builder.body(body);
+    }
+
+    request_builder
+        .build()
+        .map_err(|error| AppError::new(3, format!("failed to build request: {error}")))
+}
+
+fn execute_with_retry(
+    cli: &Cli,
+    client: &Client,
+    method: &Method,
+    url: &Url,
+    headers: &HeaderMap,
+) -> Result<Response, AppError> {
+    let mut remaining_retries = cli.retry;
+
+    loop {
+        let request = build_request(cli, client, method, url, headers)?;
+
+        if cli.verbose {
+            print_request_trace(&request);
+        }
+
+        match client.execute(request) {
+            Ok(response) => {
+                if cli.verbose {
+                    print_response_trace(&response);
+                }
+
+                if remaining_retries > 0 && should_retry_status(response.status()) {
+                    remaining_retries -= 1;
+                    sleep(retry_delay());
+                    continue;
+                }
+
+                return Ok(response);
+            }
+            Err(error) => {
+                let mapped_error = map_request_error(error);
+                if remaining_retries > 0 && should_retry_error(&mapped_error) {
+                    remaining_retries -= 1;
+                    sleep(retry_delay());
+                    continue;
+                }
+
+                return Err(mapped_error);
+            }
+        }
+    }
+}
+
+fn should_retry_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn should_retry_error(error: &AppError) -> bool {
+    matches!(error.code(), 1 | 7 | 28)
+}
+
+fn retry_delay() -> Duration {
+    #[cfg(test)]
+    {
+        Duration::from_millis(1)
+    }
+
+    #[cfg(not(test))]
+    {
+        Duration::from_secs(1)
+    }
+}
+
+fn create_response_writer(path: Option<&Path>, append: bool) -> Result<Box<dyn Write>, AppError> {
+    if !append {
+        return create_output_writer(path);
+    }
+
+    match path {
+        Some(path) if path.as_os_str() != "-" => OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map(|file| Box::new(file) as Box<dyn Write>)
+            .map_err(|error| {
+                AppError::new(
+                    23,
+                    format!("failed to open '{}' for append: {error}", path.display()),
+                )
+            }),
+        _ => create_output_writer(path),
+    }
+}
+
+fn copy_response_body<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    limit_rate: Option<u64>,
+) -> io::Result<u64> {
+    let Some(limit_rate) = limit_rate else {
+        return io::copy(reader, writer);
+    };
+
+    let started_at = Instant::now();
+    let mut transferred = 0_u64;
+    let mut buffer = [0_u8; 16 * 1024];
+
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(transferred);
+        }
+
+        writer.write_all(&buffer[..read])?;
+        transferred += read as u64;
+
+        let expected_elapsed = Duration::from_secs_f64(transferred as f64 / limit_rate as f64);
+        let elapsed = started_at.elapsed();
+        if expected_elapsed > elapsed {
+            sleep(expected_elapsed - elapsed);
+        }
+    }
+}
+
 fn render_response_headers(response: &reqwest::blocking::Response) -> Vec<u8> {
     let mut rendered = Vec::new();
     let status_line = format!(
         "{} {} {}\r\n",
         version_string(response.version()),
         response.status().as_u16(),
-        response.status().canonical_reason().unwrap_or("")
+        response.status().canonical_reason().unwrap_or(""),
     );
     rendered.extend_from_slice(status_line.as_bytes());
 
@@ -408,13 +652,13 @@ fn print_request_trace(request: &Request) {
         "> {} {} {}",
         request.method(),
         request.url(),
-        version_string(request.version())
+        version_string(request.version()),
     );
     for (name, value) in request.headers() {
         eprintln!(
             "> {}: {}",
             name.as_str(),
-            String::from_utf8_lossy(value.as_bytes())
+            String::from_utf8_lossy(value.as_bytes()),
         );
     }
     eprintln!(">");
@@ -425,13 +669,13 @@ fn print_response_trace(response: &reqwest::blocking::Response) {
         "< {} {} {}",
         version_string(response.version()),
         response.status().as_u16(),
-        response.status().canonical_reason().unwrap_or("")
+        response.status().canonical_reason().unwrap_or(""),
     );
     for (name, value) in response.headers() {
         eprintln!(
             "< {}: {}",
             name.as_str(),
-            String::from_utf8_lossy(value.as_bytes())
+            String::from_utf8_lossy(value.as_bytes()),
         );
     }
     eprintln!("<");
@@ -476,7 +720,7 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::fs;
-    use std::io::{Read, Write};
+    use std::io::{Cursor, Read, Write};
     use std::net::TcpListener;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::PathBuf;
@@ -541,8 +785,93 @@ mod tests {
     }
 
     #[test]
+    fn run_retries_after_server_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            for response in [
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 1024];
+                let _ = stream.read(&mut buffer);
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let output_path = unique_path("retry-success");
+        let cli = Cli::parse_from([
+            "mirza",
+            "--retry",
+            "1",
+            "-o",
+            output_path.to_str().unwrap(),
+            &format!("http://{address}"),
+        ]);
+
+        run(&cli).unwrap();
+        handle.join().unwrap();
+        let written = fs::read(&output_path).unwrap();
+        fs::remove_file(&output_path).unwrap();
+        assert_eq!(written, b"ok");
+    }
+
+    #[test]
+    fn run_resumes_download_into_existing_file() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 1024];
+            let read = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
+            assert!(request.contains("range: bytes=2-"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nConnection: close\r\n\r\ncd",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let output_path = unique_path("resume-output");
+        fs::write(&output_path, b"ab").unwrap();
+        let cli = Cli::parse_from([
+            "mirza",
+            "-C",
+            "-",
+            "-o",
+            output_path.to_str().unwrap(),
+            &format!("http://{address}"),
+        ]);
+
+        run(&cli).unwrap();
+        handle.join().unwrap();
+        let written = fs::read(&output_path).unwrap();
+        fs::remove_file(&output_path).unwrap();
+        assert_eq!(written, b"abcd");
+    }
+
+    #[test]
     fn validate_cli_rejects_multiple_payload_modes() {
         let cli = Cli::parse_from(["mirza", "-d", "a=1", "--json", "{}", "https://example.com"]);
+        assert_eq!(validate_cli(&cli).unwrap_err().code(), 2);
+    }
+
+    #[test]
+    fn validate_cli_rejects_range_and_continue_at_together() {
+        let cli = Cli::parse_from([
+            "mirza",
+            "-C",
+            "0",
+            "-r",
+            "bytes=0-10",
+            "-o",
+            "file.txt",
+            "https://example.com",
+        ]);
         assert_eq!(validate_cli(&cli).unwrap_err().code(), 2);
     }
 
@@ -615,10 +944,7 @@ mod tests {
 
     #[test]
     fn duration_from_secs_converts_positive_values() {
-        assert_eq!(
-            duration_from_secs(1.5).unwrap(),
-            StdDuration::from_millis(1500)
-        );
+        assert_eq!(duration_from_secs(1.5).unwrap(), StdDuration::from_millis(1500));
     }
 
     #[test]
@@ -629,25 +955,66 @@ mod tests {
     #[test]
     fn build_headers_includes_custom_header() {
         let cli = Cli::parse_from(["mirza", "-H", "x-test: 1", "https://example.com"]);
-        let headers = build_headers(&cli).unwrap();
+        let headers = build_headers(&cli, None).unwrap();
         assert_eq!(headers.get("x-test").unwrap(), "1");
     }
 
     #[test]
     fn build_headers_adds_json_content_type() {
         let cli = Cli::parse_from(["mirza", "--json", "{}", "https://example.com"]);
-        let headers = build_headers(&cli).unwrap();
+        let headers = build_headers(&cli, None).unwrap();
         assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "application/json");
     }
 
     #[test]
     fn build_headers_adds_form_content_type_for_data() {
         let cli = Cli::parse_from(["mirza", "-d", "a=1", "https://example.com"]);
-        let headers = build_headers(&cli).unwrap();
-        assert_eq!(
-            headers.get(CONTENT_TYPE).unwrap(),
-            "application/x-www-form-urlencoded"
-        );
+        let headers = build_headers(&cli, None).unwrap();
+        assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "application/x-www-form-urlencoded");
+    }
+
+    #[test]
+    fn build_headers_adds_explicit_range_header() {
+        let cli = Cli::parse_from(["mirza", "-r", "bytes=5-10", "https://example.com"]);
+        let headers = build_headers(&cli, None).unwrap();
+        assert_eq!(headers.get(RANGE).unwrap(), "bytes=5-10");
+    }
+
+    #[test]
+    fn build_headers_adds_resume_range_header() {
+        let cli = Cli::parse_from(["mirza", "-o", "file.txt", "https://example.com"]);
+        let headers = build_headers(&cli, Some(7)).unwrap();
+        assert_eq!(headers.get(RANGE).unwrap(), "bytes=7-");
+    }
+
+    #[test]
+    fn resolve_resume_offset_uses_explicit_value() {
+        let cli = Cli::parse_from([
+            "mirza",
+            "-C",
+            "12",
+            "-o",
+            "file.txt",
+            "https://example.com",
+        ]);
+        assert_eq!(resolve_resume_offset(&cli).unwrap(), Some(12));
+    }
+
+    #[test]
+    fn resolve_resume_offset_reads_existing_file_size() {
+        let path = unique_path("resume-offset");
+        fs::write(&path, b"abcdef").unwrap();
+        let cli = Cli::parse_from([
+            "mirza",
+            "-C",
+            "-",
+            "-o",
+            path.to_str().unwrap(),
+            "https://example.com",
+        ]);
+        let offset = resolve_resume_offset(&cli).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(offset, Some(6));
     }
 
     #[test]
@@ -685,11 +1052,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_rate_limit_parses_suffixes() {
+        assert_eq!(parse_rate_limit(Some("2K")).unwrap(), Some(2048));
+    }
+
+    #[test]
+    fn parse_rate_limit_rejects_invalid_suffix() {
+        assert_eq!(parse_rate_limit(Some("2Q")).unwrap_err().code(), 2);
+    }
+
+    #[test]
     fn read_data_segment_returns_literal_bytes() {
-        assert_eq!(
-            read_data_segment("plain", false).unwrap(),
-            b"plain".to_vec()
-        );
+        assert_eq!(read_data_segment("plain", false).unwrap(), b"plain".to_vec());
     }
 
     #[test]
@@ -738,16 +1112,28 @@ mod tests {
     }
 
     #[test]
+    fn copy_response_body_writes_payload_without_rate_limit() {
+        let mut reader = Cursor::new(b"payload".to_vec());
+        let mut writer = Vec::new();
+        let written = copy_response_body(&mut reader, &mut writer, None).unwrap();
+        assert_eq!((written, writer), (7, b"payload".to_vec()));
+    }
+
+    #[test]
+    fn copy_response_body_writes_payload_with_rate_limit() {
+        let mut reader = Cursor::new(b"payload".to_vec());
+        let mut writer = Vec::new();
+        let written = copy_response_body(&mut reader, &mut writer, Some(1024)).unwrap();
+        assert_eq!((written, writer), (7, b"payload".to_vec()));
+    }
+
+    #[test]
     fn render_response_headers_contains_status_line() {
         let (url, handle) = spawn_server(ok_response());
         let response = reqwest::blocking::get(url).unwrap();
         let rendered = render_response_headers(&response);
         handle.join().unwrap();
-        assert!(
-            String::from_utf8(rendered)
-                .unwrap()
-                .starts_with("HTTP/1.1 200 OK\r\n")
-        );
+        assert!(String::from_utf8(rendered).unwrap().starts_with("HTTP/1.1 200 OK\r\n"));
     }
 
     #[test]

@@ -79,6 +79,18 @@ pub struct Cli {
     #[arg(short = 'm', long = "max-time")]
     pub max_time: Option<f64>,
 
+    #[arg(long = "retry", default_value_t = 0)]
+    pub retry: u32,
+
+    #[arg(short = 'C', long = "continue-at")]
+    pub continue_at: Option<String>,
+
+    #[arg(short = 'r', long = "range")]
+    pub range: Option<String>,
+
+    #[arg(long = "limit-rate")]
+    pub limit_rate: Option<String>,
+
     #[arg(short = 'o', long = "output", value_hint = ValueHint::FilePath)]
     pub output: Option<PathBuf>,
 
@@ -120,5 +132,24 @@ mod tests {
         assert!(
             Cli::try_parse_from(["mirza", "--http1.1", "--http2", "https://example.com",]).is_err()
         );
+    }
+
+    #[test]
+    fn parse_sets_retry_count() {
+        let cli = Cli::parse_from(["mirza", "--retry", "2", "https://example.com"]);
+        assert_eq!(cli.retry, 2);
+    }
+
+    #[test]
+    fn parse_sets_continue_at() {
+        let cli = Cli::parse_from([
+            "mirza",
+            "-C",
+            "-",
+            "-o",
+            "out.bin",
+            "https://example.com",
+        ]);
+        assert_eq!(cli.continue_at.as_deref(), Some("-"));
     }
 }
