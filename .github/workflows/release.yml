@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-release:
+    name: Release On ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: mirza-x86_64-unknown-linux-gnu
+            binary_name: mirza
+            binary_path: target/release/mirza
+            archive_name: mirza-x86_64-unknown-linux-gnu.tar.gz
+            archive_kind: tar
+          - os: macos-latest
+            artifact_name: mirza-x86_64-apple-darwin
+            binary_name: mirza
+            binary_path: target/release/mirza
+            archive_name: mirza-x86_64-apple-darwin.tar.gz
+            archive_kind: tar
+          - os: windows-latest
+            artifact_name: mirza-x86_64-pc-windows-msvc
+            binary_name: mirza.exe
+            binary_path: target/release/mirza.exe
+            archive_name: mirza-x86_64-pc-windows-msvc.zip
+            archive_kind: zip
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo data
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Prepare archive directory
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "${{ matrix.binary_path }}" "dist/${{ matrix.binary_name }}"
+          cp README.md dist/README.md
+          cp LICENSE dist/LICENSE
+
+      - name: Create tar archive
+        if: matrix.archive_kind == 'tar'
+        shell: bash
+        run: |
+          tar -czf "${{ matrix.archive_name }}" -C dist .
+
+      - name: Create zip archive
+        if: matrix.archive_kind == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.archive_name }}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.archive_name }}
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.archive_name }}
