@@ -1,5 +1,29 @@
-use clap::{ArgAction, Parser, ValueHint};
+use clap::{ArgAction, Parser, ValueEnum, ValueHint};
 use std::path::PathBuf;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum OutputStyle {
+    Auto,
+    Raw,
+    Pretty,
+    Json,
+    Compact,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum OutputSection {
+    Meta,
+    Headers,
+    Body,
+    All,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ColorMode {
+    Auto,
+    Always,
+    Never,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "mirza", version, about = "Native Rust curl-like HTTP client")]
@@ -91,6 +115,15 @@ pub struct Cli {
     #[arg(long = "limit-rate")]
     pub limit_rate: Option<String>,
 
+    #[arg(long = "output-style", value_enum, default_value_t = OutputStyle::Auto)]
+    pub output_style: OutputStyle,
+
+    #[arg(long = "show", value_enum, value_delimiter = ',', action = ArgAction::Append)]
+    pub show: Vec<OutputSection>,
+
+    #[arg(long = "color", value_enum, default_value_t = ColorMode::Auto)]
+    pub color: ColorMode,
+
     #[arg(short = 'o', long = "output", value_hint = ValueHint::FilePath)]
     pub output: Option<PathBuf>,
 
@@ -144,5 +177,39 @@ mod tests {
     fn parse_sets_continue_at() {
         let cli = Cli::parse_from(["mirza", "-C", "-", "-o", "out.bin", "https://example.com"]);
         assert_eq!(cli.continue_at.as_deref(), Some("-"));
+    }
+
+    #[test]
+    fn parse_sets_output_style_and_color() {
+        let cli = Cli::parse_from([
+            "mirza",
+            "--output-style",
+            "pretty",
+            "--color",
+            "always",
+            "https://example.com",
+        ]);
+        assert_eq!(cli.output_style, OutputStyle::Pretty);
+        assert_eq!(cli.color, ColorMode::Always);
+    }
+
+    #[test]
+    fn parse_collects_output_sections() {
+        let cli = Cli::parse_from([
+            "mirza",
+            "--show",
+            "meta,headers",
+            "--show",
+            "body",
+            "https://example.com",
+        ]);
+        assert_eq!(
+            cli.show,
+            vec![
+                OutputSection::Meta,
+                OutputSection::Headers,
+                OutputSection::Body
+            ]
+        );
     }
 }

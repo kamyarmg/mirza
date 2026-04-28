@@ -1,4 +1,4 @@
-use crate::cli::Cli;
+use crate::cli::{Cli, ColorMode, OutputSection, OutputStyle};
 use crate::error::AppError;
 use crate::io_support::{create_output_writer, read_input_bytes, write_all_to_path};
 use reqwest::blocking::multipart::{Form, Part};
@@ -9,13 +9,36 @@ use reqwest::header::{
 };
 use reqwest::redirect::Policy;
 use reqwest::{Method, Proxy, StatusCode, Version};
+use serde_json::Value as JsonValue;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use url::Url;
+
+struct ResponseSummary {
+    body_bytes: u64,
+    total_duration: Duration,
+}
+
+struct RenderedOutput {
+    body: Vec<u8>,
+}
+
+struct DisplayOptions {
+    style: OutputStyle,
+    sections: DisplaySections,
+    use_color: bool,
+}
+
+#[derive(Copy, Clone)]
+struct DisplaySections {
+    meta: bool,
+    headers: bool,
+    body: bool,
+}
 
 pub fn run(cli: &Cli) -> Result<i32, AppError> {
     validate_cli(cli)?;
@@ -36,6 +59,7 @@ pub fn run(cli: &Cli) -> Result<i32, AppError> {
     let resume_offset = resolve_resume_offset(cli)?;
     let headers = build_headers(cli, resume_offset)?;
     let client = build_client(cli)?;
+    let started_at = Instant::now();
     let mut response = execute_with_retry(cli, &client, &method, &url, &headers)?;
 
     if cli.fail && response.status().has_client_or_server_error() {
@@ -57,24 +81,459 @@ pub fn run(cli: &Cli) -> Result<i32, AppError> {
         write_all_to_path(path, &header_block)?;
     }
 
-    let mut output = create_response_writer(cli.output.as_deref(), resume_offset.unwrap_or(0) > 0)?;
-    if cli.include {
-        output.write_all(&header_block).map_err(|error| {
-            AppError::new(23, format!("failed to write response headers: {error}"))
-        })?;
-    }
+    let display_options = display_options(cli);
+    let should_render = should_render_response(cli, &display_options);
 
-    if method != Method::HEAD {
-        let limit_rate = parse_rate_limit(cli.limit_rate.as_deref())?;
-        copy_response_body(&mut response, &mut output, limit_rate).map_err(|error| {
-            AppError::new(23, format!("failed to write response body: {error}"))
+    if should_render {
+        let rendered = render_response_output(
+            cli,
+            &method,
+            &url,
+            &mut response,
+            &header_block,
+            started_at.elapsed(),
+            &display_options,
+        )?;
+        let mut output = create_response_writer(cli.output.as_deref(), false)?;
+        output.write_all(&rendered.body).map_err(|error| {
+            AppError::new(23, format!("failed to write rendered response: {error}"))
         })?;
         output
             .flush()
             .map_err(|error| AppError::new(23, format!("failed to flush output: {error}")))?;
+    } else {
+        let mut output =
+            create_response_writer(cli.output.as_deref(), resume_offset.unwrap_or(0) > 0)?;
+        if cli.include {
+            output.write_all(&header_block).map_err(|error| {
+                AppError::new(23, format!("failed to write response headers: {error}"))
+            })?;
+        }
+
+        if method != Method::HEAD {
+            let limit_rate = parse_rate_limit(cli.limit_rate.as_deref())?;
+            copy_response_body(&mut response, &mut output, limit_rate).map_err(|error| {
+                AppError::new(23, format!("failed to write response body: {error}"))
+            })?;
+            output
+                .flush()
+                .map_err(|error| AppError::new(23, format!("failed to flush output: {error}")))?;
+        }
     }
 
     Ok(0)
+}
+
+fn should_render_response(cli: &Cli, options: &DisplayOptions) -> bool {
+    if matches!(options.style, OutputStyle::Raw) {
+        return false;
+    }
+
+    match cli.output.as_deref() {
+        Some(path) if path.as_os_str() != "-" => false,
+        _ => !cli.silent,
+    }
+}
+
+fn display_options(cli: &Cli) -> DisplayOptions {
+    DisplayOptions {
+        style: resolve_output_style(cli),
+        sections: resolve_display_sections(cli),
+        use_color: resolve_color_mode(cli),
+    }
+}
+
+fn resolve_output_style(cli: &Cli) -> OutputStyle {
+    match cli.output_style {
+        OutputStyle::Auto => {
+            if is_stdout_terminal() {
+                OutputStyle::Pretty
+            } else {
+                OutputStyle::Raw
+            }
+        }
+        style => style,
+    }
+}
+
+fn resolve_display_sections(cli: &Cli) -> DisplaySections {
+    if cli.show.is_empty() {
+        return DisplaySections {
+            meta: true,
+            headers: cli.include,
+            body: true,
+        };
+    }
+
+    let mut sections = DisplaySections {
+        meta: false,
+        headers: false,
+        body: false,
+    };
+
+    for section in &cli.show {
+        match section {
+            OutputSection::Meta => sections.meta = true,
+            OutputSection::Headers => sections.headers = true,
+            OutputSection::Body => sections.body = true,
+            OutputSection::All => {
+                sections.meta = true;
+                sections.headers = true;
+                sections.body = true;
+            }
+        }
+    }
+
+    sections
+}
+
+fn resolve_color_mode(cli: &Cli) -> bool {
+    match cli.color {
+        ColorMode::Always => true,
+        ColorMode::Never => false,
+        ColorMode::Auto => is_stdout_terminal(),
+    }
+}
+
+fn is_stdout_terminal() -> bool {
+    io::stdout().is_terminal()
+}
+
+fn render_response_output(
+    cli: &Cli,
+    method: &Method,
+    url: &Url,
+    response: &mut Response,
+    header_block: &[u8],
+    total_duration: Duration,
+    options: &DisplayOptions,
+) -> Result<RenderedOutput, AppError> {
+    let limit_rate = parse_rate_limit(cli.limit_rate.as_deref())?;
+    let mut body = Vec::new();
+
+    if method != Method::HEAD {
+        copy_response_body(response, &mut body, limit_rate).map_err(|error| {
+            AppError::new(23, format!("failed to buffer response body: {error}"))
+        })?;
+    }
+
+    let summary = ResponseSummary {
+        body_bytes: body.len() as u64,
+        total_duration,
+    };
+    let rendered = match options.style {
+        OutputStyle::Pretty | OutputStyle::Auto => render_pretty_response(
+            method,
+            url,
+            response,
+            header_block,
+            &body,
+            &summary,
+            options,
+        ),
+        OutputStyle::Json => render_json_response(
+            method,
+            url,
+            response,
+            header_block,
+            &body,
+            &summary,
+            options,
+        ),
+        OutputStyle::Compact => render_compact_response(response, &body, &summary, options),
+        OutputStyle::Raw => body.clone(),
+    };
+
+    Ok(RenderedOutput { body: rendered })
+}
+
+fn render_pretty_response(
+    method: &Method,
+    url: &Url,
+    response: &Response,
+    header_block: &[u8],
+    body: &[u8],
+    summary: &ResponseSummary,
+    options: &DisplayOptions,
+) -> Vec<u8> {
+    let mut rendered = String::new();
+
+    if options.sections.meta {
+        rendered.push_str(&format_title("Response", options.use_color));
+        rendered.push_str(&format_kv(
+            "Status",
+            &status_badge(response.status(), options.use_color),
+        ));
+        rendered.push_str(&format_kv("Method", method.as_str()));
+        rendered.push_str(&format_kv("URL", url.as_str()));
+        rendered.push_str(&format_kv("Version", version_string(response.version())));
+        rendered.push_str(&format_kv("Time", &format_duration(summary.total_duration)));
+        rendered.push_str(&format_kv("Bytes", &summary.body_bytes.to_string()));
+        if let Some(content_type) = response.headers().get(CONTENT_TYPE) {
+            rendered.push_str(&format_kv(
+                "Content-Type",
+                &String::from_utf8_lossy(content_type.as_bytes()),
+            ));
+        }
+        rendered.push('\n');
+    }
+
+    if options.sections.headers {
+        rendered.push_str(&format_title("Headers", options.use_color));
+        rendered.push_str(&String::from_utf8_lossy(header_block));
+        if !rendered.ends_with("\n\n") {
+            rendered.push('\n');
+        }
+    }
+
+    if options.sections.body {
+        rendered.push_str(&format_title("Body", options.use_color));
+        rendered.push_str(&format_body(body, response, true, true, options.use_color));
+        if !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+    }
+
+    rendered.into_bytes()
+}
+
+fn render_json_response(
+    method: &Method,
+    url: &Url,
+    response: &Response,
+    header_block: &[u8],
+    body: &[u8],
+    summary: &ResponseSummary,
+    options: &DisplayOptions,
+) -> Vec<u8> {
+    let mut object = serde_json::Map::new();
+
+    if options.sections.meta {
+        object.insert(
+            "meta".to_owned(),
+            serde_json::json!({
+                "status": response.status().as_u16(),
+                "reason": response.status().canonical_reason(),
+                "method": method.as_str(),
+                "url": url.as_str(),
+                "version": version_string(response.version()),
+                "duration_ms": summary.total_duration.as_millis(),
+                "body_bytes": summary.body_bytes,
+            }),
+        );
+    }
+
+    if options.sections.headers {
+        let mut headers = serde_json::Map::new();
+        for line in String::from_utf8_lossy(header_block).lines().skip(1) {
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(
+                    name.trim().to_owned(),
+                    serde_json::Value::String(value.trim().to_owned()),
+                );
+            }
+        }
+        object.insert("headers".to_owned(), JsonValue::Object(headers));
+    }
+
+    if options.sections.body {
+        object.insert("body".to_owned(), json_body_value(body));
+    }
+
+    serde_json::to_vec_pretty(&JsonValue::Object(object)).unwrap_or_else(|_| b"{}".to_vec())
+}
+
+fn render_compact_response(
+    response: &Response,
+    body: &[u8],
+    summary: &ResponseSummary,
+    options: &DisplayOptions,
+) -> Vec<u8> {
+    let mut rendered = String::new();
+
+    if options.sections.meta {
+        rendered.push_str(&format!(
+            "{} {} | {} | {} bytes\n",
+            status_badge(response.status(), options.use_color),
+            response.status().canonical_reason().unwrap_or(""),
+            format_duration(summary.total_duration),
+            summary.body_bytes,
+        ));
+    }
+
+    if options.sections.headers {
+        for (name, value) in response.headers() {
+            rendered.push_str(name.as_str());
+            rendered.push_str(": ");
+            rendered.push_str(&String::from_utf8_lossy(value.as_bytes()));
+            rendered.push('\n');
+        }
+    }
+
+    if options.sections.body {
+        if !rendered.is_empty() {
+            rendered.push('\n');
+        }
+        rendered.push_str(&format_body(
+            body,
+            response,
+            false,
+            false,
+            options.use_color,
+        ));
+        if !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+    }
+
+    rendered.into_bytes()
+}
+
+fn format_title(title: &str, use_color: bool) -> String {
+    let decorated = if use_color {
+        paint(title, "1;36")
+    } else {
+        title.to_owned()
+    };
+    format!("== {decorated} ==\n")
+}
+
+fn format_kv(key: &str, value: &str) -> String {
+    format!("{key:>12}: {value}\n")
+}
+
+fn status_badge(status: StatusCode, use_color: bool) -> String {
+    let plain = format!("{}", status.as_u16());
+    if !use_color {
+        return plain;
+    }
+
+    let color = if status.is_success() {
+        "1;32"
+    } else if status.is_redirection() {
+        "1;34"
+    } else if status.is_client_error() {
+        "1;33"
+    } else {
+        "1;31"
+    };
+    paint(&plain, color)
+}
+
+fn paint(text: &str, code: &str) -> String {
+    format!("\u{1b}[{code}m{text}\u{1b}[0m")
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration.as_millis() < 1000 {
+        return format!("{} ms", duration.as_millis());
+    }
+
+    format!("{:.2} s", duration.as_secs_f64())
+}
+
+fn format_body(
+    body: &[u8],
+    response: &Response,
+    pretty: bool,
+    color_json_keys: bool,
+    use_color: bool,
+) -> String {
+    if body.is_empty() {
+        return "<empty>\n".to_owned();
+    }
+
+    if pretty
+        && is_json_response(response)
+        && let Ok(json) = serde_json::from_slice::<JsonValue>(body)
+    {
+        let rendered = if color_json_keys && use_color {
+            format_json_with_colored_keys(&json, 0)
+        } else if let Ok(rendered) = serde_json::to_string_pretty(&json) {
+            rendered
+        } else {
+            String::from_utf8_lossy(body).into_owned()
+        };
+        return format!("{rendered}\n");
+    }
+
+    if let Ok(text) = std::str::from_utf8(body) {
+        return if pretty {
+            format!("{}\n", indent_lines(text.trim_end(), "  "))
+        } else {
+            text.to_owned()
+        };
+    }
+
+    format!("<binary body: {} bytes>\n", body.len())
+}
+
+fn format_json_with_colored_keys(value: &JsonValue, level: usize) -> String {
+    match value {
+        JsonValue::Object(map) => {
+            if map.is_empty() {
+                return "{}".to_owned();
+            }
+
+            let indent = "  ".repeat(level);
+            let child_indent = "  ".repeat(level + 1);
+            let mut lines = Vec::with_capacity(map.len());
+
+            for (key, entry_value) in map {
+                lines.push(format!(
+                    "{child_indent}{}: {}",
+                    paint(&format!("\"{key}\""), "1;33"),
+                    format_json_with_colored_keys(entry_value, level + 1)
+                ));
+            }
+
+            format!("{{\n{}\n{indent}}}", lines.join(",\n"))
+        }
+        JsonValue::Array(items) => {
+            if items.is_empty() {
+                return "[]".to_owned();
+            }
+
+            let indent = "  ".repeat(level);
+            let child_indent = "  ".repeat(level + 1);
+            let lines = items
+                .iter()
+                .map(|item| {
+                    format!(
+                        "{child_indent}{}",
+                        format_json_with_colored_keys(item, level + 1)
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            format!("[\n{}\n{indent}]", lines.join(",\n"))
+        }
+        JsonValue::String(text) => format!("\"{text}\""),
+        JsonValue::Number(number) => number.to_string(),
+        JsonValue::Bool(boolean) => boolean.to_string(),
+        JsonValue::Null => "null".to_owned(),
+    }
+}
+
+fn indent_lines(input: &str, prefix: &str) -> String {
+    input
+        .lines()
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_json_response(response: &Response) -> bool {
+    response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("json"))
+}
+
+fn json_body_value(body: &[u8]) -> JsonValue {
+    serde_json::from_slice(body)
+        .unwrap_or_else(|_| JsonValue::String(String::from_utf8_lossy(body).into_owned()))
 }
 
 fn validate_cli(cli: &Cli) -> Result<(), AppError> {
@@ -1147,6 +1606,50 @@ mod tests {
                 .unwrap()
                 .starts_with("HTTP/1.1 200 OK\r\n")
         );
+    }
+
+    #[test]
+    fn render_pretty_response_formats_json_body() {
+        let (url, handle) = spawn_server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 16\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"name\":\"mirza\"}",
+        );
+        let response = reqwest::blocking::get(&url).unwrap();
+        let header_block = render_response_headers(&response);
+        let rendered = render_pretty_response(
+            &Method::GET,
+            &Url::parse(&url).unwrap(),
+            &response,
+            &header_block,
+            br#"{"name":"mirza"}"#,
+            &ResponseSummary {
+                body_bytes: 16,
+                total_duration: StdDuration::from_millis(42),
+            },
+            &DisplayOptions {
+                style: OutputStyle::Pretty,
+                sections: DisplaySections {
+                    meta: true,
+                    headers: true,
+                    body: true,
+                },
+                use_color: false,
+            },
+        );
+        handle.join().unwrap();
+        let rendered = String::from_utf8(rendered).unwrap();
+        assert!(rendered.contains("== Response =="));
+        assert!(rendered.contains("== Headers =="));
+        assert!(rendered.contains("== Body =="));
+        assert!(rendered.contains("  \"name\": \"mirza\""));
+    }
+
+    #[test]
+    fn resolve_display_sections_defaults_to_meta_and_body() {
+        let cli = Cli::parse_from(["mirza", "https://example.com"]);
+        let sections = resolve_display_sections(&cli);
+        assert!(sections.meta);
+        assert!(sections.body);
+        assert!(!sections.headers);
     }
 
     #[test]
