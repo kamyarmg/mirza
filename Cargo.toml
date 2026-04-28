@@ -1,0 +1,17 @@
+[package]
+name = "mirza"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.38", features = ["derive"] }
+reqwest = { version = "0.12.15", default-features = false, features = [
+    "blocking",
+    "multipart",
+    "rustls-tls",
+    "gzip",
+    "brotli",
+    "deflate",
+    "zstd",
+] }
+url = "2.5.4"
