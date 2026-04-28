@@ -117,12 +117,8 @@ mod tests {
 
     #[test]
     fn parse_rejects_conflicting_http_flags() {
-        assert!(Cli::try_parse_from([
-            "mirza",
-            "--http1.1",
-            "--http2",
-            "https://example.com",
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from(["mirza", "--http1.1", "--http2", "https://example.com",]).is_err()
+        );
     }
 }
