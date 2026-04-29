@@ -61,7 +61,7 @@ const MULTIPART_SUGGESTIONS: [&str; 4] = [
 const METHOD_SUGGESTIONS: [&str; 7] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
 const OUTPUT_STYLE_SUGGESTIONS: [&str; 5] = ["pretty", "json", "compact", "raw", "auto"];
 const COLOR_SUGGESTIONS: [&str; 3] = ["auto", "always", "never"];
-const COMMAND_SUGGESTIONS: [&str; 9] = [
+const COMMAND_SUGGESTIONS: [&str; 11] = [
     "r",
     "q",
     "w",
@@ -69,9 +69,12 @@ const COMMAND_SUGGESTIONS: [&str; 9] = [
     ":w response.json",
     ":tab basic",
     ":tab headers",
+    ":tabs horizontal",
+    ":tabs vertical",
     ":body json",
     ":body form",
 ];
+const TAB_LAYOUT_SUGGESTIONS: [&str; 2] = ["horizontal", "vertical"];
 
 const BASIC_FIELDS: [BasicField; 7] = [
     BasicField::Url,
@@ -83,7 +86,8 @@ const BASIC_FIELDS: [BasicField; 7] = [
     BasicField::Compressed,
 ];
 
-const SETTING_FIELDS: [SettingField; 9] = [
+const SETTING_FIELDS: [SettingField; 10] = [
+    SettingField::TabLayout,
     SettingField::OutputStyle,
     SettingField::Color,
     SettingField::Retry,
@@ -156,64 +160,98 @@ fn draw(frame: &mut Frame<'_>, state: &InteractiveState) {
 }
 
 fn draw_display(frame: &mut Frame<'_>, area: Rect, state: &InteractiveState) {
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(5)])
-        .split(area);
+    match state.tab_layout {
+        TabLayout::Horizontal => {
+            let sections = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(5)])
+                .split(area);
 
-    let tabs = Line::from(
-        Tab::ALL
-            .iter()
-            .flat_map(|tab| {
-                let style = if !state.is_tab_enabled(*tab) {
-                    Style::default().fg(Color::DarkGray)
-                } else if *tab == state.active_tab {
-                    Style::default()
-                        .fg(PANEL)
-                        .bg(BLUE)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(MUTED)
-                };
-                vec![
-                    Span::styled(format!(" {} ", tab.label()), style),
-                    Span::raw(" "),
-                ]
-            })
-            .collect::<Vec<_>>(),
-    );
+            let tabs = Line::from(
+                Tab::ALL
+                    .iter()
+                    .flat_map(|tab| {
+                        vec![
+                            Span::styled(format!(" {} ", tab.label()), tab_style(state, *tab)),
+                            Span::raw(" "),
+                        ]
+                    })
+                    .collect::<Vec<_>>(),
+            );
 
-    let header = Paragraph::new(tabs).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(PANEL)),
-    );
-    frame.render_widget(header, sections[0]);
+            let header = Paragraph::new(tabs).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(PANEL)),
+            );
+            frame.render_widget(header, sections[0]);
+            draw_active_tab(frame, sections[1], state);
+        }
+        TabLayout::Vertical => {
+            let sections = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(16), Constraint::Min(5)])
+                .split(area);
 
+            let items = Tab::ALL
+                .iter()
+                .map(|tab| {
+                    ListItem::new(Span::styled(
+                        format!(" {} ", tab.label()),
+                        tab_style(state, *tab),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let tabs = List::new(items).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(PANEL))
+                    .title(Span::styled("Tabs", Style::default().fg(INK))),
+            );
+            frame.render_widget(tabs, sections[0]);
+            draw_active_tab(frame, sections[1], state);
+        }
+    }
+}
+
+fn draw_active_tab(frame: &mut Frame<'_>, area: Rect, state: &InteractiveState) {
     match state.active_tab {
-        Tab::Request => draw_request_tab(frame, sections[1], state),
-        Tab::Basic => draw_basic_tab(frame, sections[1], state),
+        Tab::Request => draw_request_tab(frame, area, state),
+        Tab::Basic => draw_basic_tab(frame, area, state),
         Tab::Headers => draw_collection_tab(
             frame,
-            sections[1],
+            area,
             "Headers",
             &state.headers,
             state.header_index,
             state.active_tab == Tab::Headers,
         ),
-        Tab::Body => draw_body_tab(frame, sections[1], state),
+        Tab::Body => draw_body_tab(frame, area, state),
         Tab::Params => draw_collection_tab(
             frame,
-            sections[1],
+            area,
             "Query Params",
             &state.params,
             state.param_index,
             state.active_tab == Tab::Params,
         ),
-        Tab::Response => draw_response_summary_tab(frame, sections[1], state),
-        Tab::Meta => draw_response_meta_tab(frame, sections[1], state),
-        Tab::Data => draw_response_data_tab(frame, sections[1], state),
-        Tab::Settings => draw_settings_tab(frame, sections[1], state),
+        Tab::Response => draw_response_summary_tab(frame, area, state),
+        Tab::Meta => draw_response_meta_tab(frame, area, state),
+        Tab::Data => draw_response_data_tab(frame, area, state),
+        Tab::Settings => draw_settings_tab(frame, area, state),
+    }
+}
+
+fn tab_style(state: &InteractiveState, tab: Tab) -> Style {
+    if !state.is_tab_enabled(tab) {
+        Style::default().fg(Color::DarkGray)
+    } else if tab == state.active_tab {
+        Style::default()
+            .fg(PANEL)
+            .bg(BLUE)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(MUTED)
     }
 }
 
@@ -691,6 +729,18 @@ fn execute_internal_command(state: &mut InteractiveState, command: &str) -> Resu
                 sync_command_from_selection(state);
             } else {
                 state.last_error = Some(format!("unknown body mode: {value}"));
+            }
+            Ok(false)
+        }
+        "tabs" => {
+            let value = parts.next().unwrap_or_default();
+            if let Some(layout) = TabLayout::from_name(value) {
+                state.tab_layout = layout;
+                state.status_line = format!("tab layout set to {}", layout.label());
+                state.last_error = None;
+                sync_command_from_selection(state);
+            } else {
+                state.last_error = Some(format!("unknown tab layout: {value}"));
             }
             Ok(false)
         }
@@ -1172,6 +1222,7 @@ fn selection_command(state: &InteractiveState) -> Option<String> {
         },
         Tab::Params => state.params.get(state.param_index).cloned(),
         Tab::Settings => Some(match SETTING_FIELDS[state.settings_index] {
+            SettingField::TabLayout => format!(":tabs {}", state.tab_layout.label()),
             SettingField::OutputStyle => format!("--output-style {}", state.output_style),
             SettingField::Color => format!("--color {}", state.color),
             SettingField::Retry => format!("--retry {}", state.retry),
@@ -1206,6 +1257,12 @@ fn suggestions_for_command(state: &InteractiveState) -> Vec<String> {
     }
 
     if input.starts_with(':') {
+        if input.trim_start_matches(':').starts_with("tabs") {
+            return filter_suggestions(
+                last_argument_value(input.trim_start_matches(':')),
+                &TAB_LAYOUT_SUGGESTIONS,
+            );
+        }
         return filter_suggestions(input.trim_start_matches(':'), &COMMAND_SUGGESTIONS);
     }
     if input.starts_with("-h") || input.starts_with("-H") || input.starts_with("--header") {
@@ -1369,6 +1426,7 @@ impl BasicField {
 
 #[derive(Copy, Clone)]
 enum SettingField {
+    TabLayout,
     OutputStyle,
     Color,
     Retry,
@@ -1383,6 +1441,7 @@ enum SettingField {
 impl SettingField {
     fn label(self) -> &'static str {
         match self {
+            Self::TabLayout => "TabLayout",
             Self::OutputStyle => "OutputStyle",
             Self::Color => "Color",
             Self::Retry => "Retry",
@@ -1396,8 +1455,32 @@ impl SettingField {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum TabLayout {
+    Horizontal,
+    Vertical,
+}
+
+impl TabLayout {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Horizontal => "horizontal",
+            Self::Vertical => "vertical",
+        }
+    }
+
+    fn from_name(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "horizontal" => Some(Self::Horizontal),
+            "vertical" | "column" | "vertical-column" => Some(Self::Vertical),
+            _ => None,
+        }
+    }
+}
+
 struct InteractiveState {
     active_tab: Tab,
+    tab_layout: TabLayout,
     body_mode: BodyMode,
     basic_index: usize,
     header_index: usize,
@@ -1455,6 +1538,7 @@ impl InteractiveState {
 
         let mut state = Self {
             active_tab: Tab::Request,
+            tab_layout: TabLayout::Vertical,
             body_mode,
             basic_index: 0,
             header_index: 0,
@@ -1664,6 +1748,7 @@ impl InteractiveState {
 
     fn setting_value(&self, field: SettingField) -> String {
         match field {
+            SettingField::TabLayout => self.tab_layout.label().to_owned(),
             SettingField::OutputStyle => display_text(&self.output_style),
             SettingField::Color => display_text(&self.color),
             SettingField::Retry => display_text(&self.retry),
@@ -1779,5 +1864,20 @@ mod tests {
         let mut state = InteractiveState::from_cli(Cli::parse_from(["mirza", "--interactive"]));
         state.active_tab = Tab::Params;
         assert_eq!(state.next_enabled_tab(), Tab::Settings);
+    }
+
+    #[test]
+    fn settings_selection_command_exposes_tab_layout_command() {
+        let mut state = InteractiveState::from_cli(Cli::parse_from(["mirza", "--interactive"]));
+        state.active_tab = Tab::Settings;
+        state.settings_index = 0;
+        assert_eq!(selection_command(&state).as_deref(), Some(":tabs vertical"));
+    }
+
+    #[test]
+    fn internal_tabs_command_switches_to_vertical_layout() {
+        let mut state = InteractiveState::from_cli(Cli::parse_from(["mirza", "--interactive"]));
+        execute_internal_command(&mut state, "tabs vertical").unwrap();
+        assert_eq!(state.tab_layout, TabLayout::Vertical);
     }
 }
