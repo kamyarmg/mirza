@@ -11,7 +11,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use serde_json::Value as JsonValue;
 use std::io::{self, Stdout};
@@ -157,6 +157,101 @@ fn draw(frame: &mut Frame<'_>, state: &InteractiveState) {
 
     draw_display(frame, sections[0], state);
     draw_command_bar(frame, sections[1], state);
+
+    if let Some(popup) = &state.popup {
+        draw_popup(frame, popup);
+    }
+}
+
+fn draw_popup(frame: &mut Frame<'_>, popup: &PopupState) {
+    let area = centered_rect(64, popup.height(), frame.area());
+    frame.render_widget(Clear, area);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(
+            popup.title.as_str(),
+            Style::default().fg(INK).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled("Enter apply", Style::default().fg(MUTED)),
+        Span::raw("  "),
+        Span::styled("Esc cancel", Style::default().fg(MUTED)),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(BLUE)),
+    );
+    frame.render_widget(header, sections[0]);
+
+    match popup.kind {
+        PopupKind::Text => {
+            let input = Paragraph::new(popup.input.as_str())
+                .style(Style::default().fg(INK))
+                .block(
+                    Block::default()
+                        .borders(Borders::LEFT | Borders::RIGHT)
+                        .border_style(Style::default().fg(BLUE)),
+                );
+            frame.render_widget(input, sections[1]);
+            frame.set_cursor_position((sections[1].x + popup.cursor as u16, sections[1].y));
+        }
+        PopupKind::Choice => {
+            let items = popup
+                .options
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let style = if index == popup.selected_option {
+                        Style::default()
+                            .fg(PANEL)
+                            .bg(GOLD)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(INK)
+                    };
+                    ListItem::new(Span::styled(value.clone(), style))
+                })
+                .collect::<Vec<_>>();
+            let list = List::new(items).block(
+                Block::default()
+                    .borders(Borders::LEFT | Borders::RIGHT)
+                    .border_style(Style::default().fg(BLUE)),
+            );
+            frame.render_widget(list, sections[1]);
+        }
+    }
+
+    let footer = Paragraph::new(Line::from(Span::styled(
+        popup.hint.as_str(),
+        Style::default().fg(MUTED),
+    )))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(BLUE)),
+    );
+    frame.render_widget(footer, sections[2]);
+}
+
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let popup_width = width.min(area.width.saturating_sub(4)).max(10);
+    let popup_height = height.min(area.height.saturating_sub(2)).max(3);
+    Rect {
+        x: area.x + area.width.saturating_sub(popup_width) / 2,
+        y: area.y + area.height.saturating_sub(popup_height) / 2,
+        width: popup_width,
+        height: popup_height,
+    }
 }
 
 fn draw_display(frame: &mut Frame<'_>, area: Rect, state: &InteractiveState) {
@@ -179,11 +274,14 @@ fn draw_display(frame: &mut Frame<'_>, area: Rect, state: &InteractiveState) {
                     .collect::<Vec<_>>(),
             );
 
-            let header = Paragraph::new(tabs).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(PANEL)),
-            );
+            let header =
+                Paragraph::new(tabs).block(Block::default().borders(Borders::ALL).border_style(
+                    Style::default().fg(if state.focused_pane == PaneFocus::Tabs {
+                        BLUE
+                    } else {
+                        PANEL
+                    }),
+                ));
             frame.render_widget(header, sections[0]);
             draw_active_tab(frame, sections[1], state);
         }
@@ -205,7 +303,13 @@ fn draw_display(frame: &mut Frame<'_>, area: Rect, state: &InteractiveState) {
             let tabs = List::new(items).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(PANEL))
+                    .border_style(
+                        Style::default().fg(if state.focused_pane == PaneFocus::Tabs {
+                            BLUE
+                        } else {
+                            PANEL
+                        }),
+                    )
                     .title(Span::styled("Tabs", Style::default().fg(INK))),
             );
             frame.render_widget(tabs, sections[0]);
@@ -307,7 +411,10 @@ fn draw_request_tab(frame: &mut Frame<'_>, area: Rect, state: &InteractiveState)
 
     let widget = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
-        .block(content_block("Request", state.active_tab == Tab::Request));
+        .block(content_block(
+            "Request",
+            state.active_tab == Tab::Request && state.focused_pane == PaneFocus::Details,
+        ));
     frame.render_widget(widget, area);
 }
 
@@ -328,7 +435,10 @@ fn draw_basic_tab(frame: &mut Frame<'_>, area: Rect, state: &InteractiveState) {
         })
         .collect::<Vec<_>>();
 
-    let widget = List::new(items).block(content_block("Basic", state.active_tab == Tab::Basic));
+    let widget = List::new(items).block(content_block(
+        "Basic",
+        state.active_tab == Tab::Basic && state.focused_pane == PaneFocus::Details,
+    ));
     frame.render_widget(widget, area);
 }
 
@@ -393,7 +503,11 @@ fn draw_body_tab(frame: &mut Frame<'_>, area: Rect, state: &InteractiveState) {
         Block::default()
             .borders(Borders::LEFT | Borders::RIGHT | Borders::TOP)
             .border_style(Style::default().fg(if state.active_tab == Tab::Body {
-                BLUE
+                if state.focused_pane == PaneFocus::Details {
+                    BLUE
+                } else {
+                    PANEL
+                }
             } else {
                 PANEL
             }))
@@ -402,13 +516,12 @@ fn draw_body_tab(frame: &mut Frame<'_>, area: Rect, state: &InteractiveState) {
     frame.render_widget(tabs, sections[0]);
 
     match state.body_mode {
-        BodyMode::Data => draw_collection_tab(
+        BodyMode::Json => draw_text_panel(
             frame,
             sections[1],
-            "Data Fields",
-            &state.body_data,
-            state.body_data_index,
-            true,
+            "JSON Payload",
+            &display_text(&state.body_json),
+            state.active_tab == Tab::Body && state.focused_pane == PaneFocus::Details,
         ),
         BodyMode::Form => draw_collection_tab(
             frame,
@@ -416,21 +529,14 @@ fn draw_body_tab(frame: &mut Frame<'_>, area: Rect, state: &InteractiveState) {
             "Multipart Fields",
             &state.body_form,
             state.body_form_index,
-            true,
-        ),
-        BodyMode::Json => draw_text_panel(
-            frame,
-            sections[1],
-            "JSON Payload",
-            &display_text(&state.body_json),
-            state.active_tab == Tab::Body,
+            state.active_tab == Tab::Body && state.focused_pane == PaneFocus::Details,
         ),
         BodyMode::Raw => draw_text_panel(
             frame,
             sections[1],
             "Raw Payload",
             &display_text(&state.body_raw),
-            state.active_tab == Tab::Body,
+            state.active_tab == Tab::Body && state.focused_pane == PaneFocus::Details,
         ),
     }
 }
@@ -460,7 +566,7 @@ fn draw_response_summary_tab(frame: &mut Frame<'_>, area: Rect, state: &Interact
         area,
         "Response",
         &text,
-        state.active_tab == Tab::Response,
+        state.active_tab == Tab::Response && state.focused_pane == PaneFocus::Details,
     );
 }
 
@@ -470,7 +576,13 @@ fn draw_response_meta_tab(frame: &mut Frame<'_>, area: Rect, state: &Interactive
     } else {
         String::from("No meta information yet.")
     };
-    draw_text_panel(frame, area, "Meta", &text, state.active_tab == Tab::Meta);
+    draw_text_panel(
+        frame,
+        area,
+        "Meta",
+        &text,
+        state.active_tab == Tab::Meta && state.focused_pane == PaneFocus::Details,
+    );
 }
 
 fn draw_response_data_tab(frame: &mut Frame<'_>, area: Rect, state: &InteractiveState) {
@@ -483,7 +595,10 @@ fn draw_response_data_tab(frame: &mut Frame<'_>, area: Rect, state: &Interactive
         .scroll((state.response_scroll, 0))
         .wrap(Wrap { trim: false })
         .style(Style::default().fg(INK))
-        .block(content_block("Data", state.active_tab == Tab::Data));
+        .block(content_block(
+            "Data",
+            state.active_tab == Tab::Data && state.focused_pane == PaneFocus::Details,
+        ));
     frame.render_widget(widget, area);
 }
 
@@ -504,8 +619,10 @@ fn draw_settings_tab(frame: &mut Frame<'_>, area: Rect, state: &InteractiveState
         })
         .collect::<Vec<_>>();
 
-    let widget =
-        List::new(items).block(content_block("Settings", state.active_tab == Tab::Settings));
+    let widget = List::new(items).block(content_block(
+        "Settings",
+        state.active_tab == Tab::Settings && state.focused_pane == PaneFocus::Details,
+    ));
     frame.render_widget(widget, area);
 }
 
@@ -574,38 +691,35 @@ fn display_text(input: &str) -> String {
 }
 
 fn handle_key(state: &mut InteractiveState, key: KeyEvent) -> Result<bool, AppError> {
+    if state.popup.is_some() {
+        return handle_popup_key(state, key);
+    }
+
     match key.code {
-        KeyCode::Tab => {
-            state.active_tab = state.next_enabled_tab();
-            sync_command_from_selection(state);
-        }
-        KeyCode::BackTab => {
-            state.active_tab = state.prev_enabled_tab();
-            sync_command_from_selection(state);
-        }
+        KeyCode::Tab | KeyCode::BackTab => {}
         KeyCode::Up => {
-            move_selection_up(state);
+            if state.focused_pane == PaneFocus::Tabs {
+                state.active_tab = state.prev_enabled_tab();
+            } else {
+                move_selection_up(state);
+            }
             sync_command_from_selection(state);
         }
         KeyCode::Down => {
-            move_selection_down(state);
+            if state.focused_pane == PaneFocus::Tabs {
+                state.active_tab = state.next_enabled_tab();
+            } else {
+                move_selection_down(state);
+            }
             sync_command_from_selection(state);
         }
         KeyCode::Left => {
-            if state.active_tab == Tab::Body {
-                state.body_mode = state.body_mode.prev();
-                sync_command_from_selection(state);
-            } else if matches!(state.active_tab, Tab::Response | Tab::Meta | Tab::Data) {
-                state.response_scroll = state.response_scroll.saturating_sub(1);
-            }
+            state.focused_pane = PaneFocus::Tabs;
+            sync_command_from_selection(state);
         }
         KeyCode::Right => {
-            if state.active_tab == Tab::Body {
-                state.body_mode = state.body_mode.next();
-                sync_command_from_selection(state);
-            } else if matches!(state.active_tab, Tab::Response | Tab::Meta | Tab::Data) {
-                state.response_scroll = state.response_scroll.saturating_add(1);
-            }
+            state.focused_pane = PaneFocus::Details;
+            sync_command_from_selection(state);
         }
         KeyCode::Home => {
             if matches!(state.active_tab, Tab::Response | Tab::Meta | Tab::Data) {
@@ -635,6 +749,9 @@ fn handle_key(state: &mut InteractiveState, key: KeyEvent) -> Result<bool, AppEr
             state.command_line.pop();
         }
         KeyCode::Enter => {
+            if try_open_editor_popup(state) {
+                return Ok(false);
+            }
             return execute_command_line(state);
         }
         KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -644,6 +761,166 @@ fn handle_key(state: &mut InteractiveState, key: KeyEvent) -> Result<bool, AppEr
     }
 
     Ok(false)
+}
+
+fn handle_popup_key(state: &mut InteractiveState, key: KeyEvent) -> Result<bool, AppError> {
+    let Some(popup) = state.popup.as_mut() else {
+        return Ok(false);
+    };
+
+    match popup.kind {
+        PopupKind::Text => match key.code {
+            KeyCode::Esc => {
+                state.popup = None;
+            }
+            KeyCode::Enter => {
+                apply_popup_value(state)?;
+            }
+            KeyCode::Backspace => {
+                if popup.cursor > 0 {
+                    popup.cursor -= 1;
+                    popup.input.remove(popup.cursor);
+                }
+            }
+            KeyCode::Left => {
+                popup.cursor = popup.cursor.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                popup.cursor = (popup.cursor + 1).min(popup.input.len());
+            }
+            KeyCode::Home => {
+                popup.cursor = 0;
+            }
+            KeyCode::End => {
+                popup.cursor = popup.input.len();
+            }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                popup.input.insert(popup.cursor, character);
+                popup.cursor += 1;
+            }
+            _ => {}
+        },
+        PopupKind::Choice => match key.code {
+            KeyCode::Esc => {
+                state.popup = None;
+            }
+            KeyCode::Enter => {
+                apply_popup_value(state)?;
+            }
+            KeyCode::Up => {
+                popup.selected_option = popup.selected_option.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if !popup.options.is_empty() {
+                    popup.selected_option =
+                        (popup.selected_option + 1).min(popup.options.len().saturating_sub(1));
+                }
+            }
+            _ => {}
+        },
+    }
+
+    Ok(false)
+}
+
+fn try_open_editor_popup(state: &mut InteractiveState) -> bool {
+    let popup = match state.active_tab {
+        Tab::Headers => Some(PopupState::text(
+            PopupTarget::Header,
+            "Edit Header",
+            state
+                .headers
+                .get(state.header_index)
+                .cloned()
+                .unwrap_or_default(),
+            "example: Content-Type: application/json",
+        )),
+        Tab::Params => Some(PopupState::text(
+            PopupTarget::Param,
+            "Edit Query Param",
+            state
+                .params
+                .get(state.param_index)
+                .cloned()
+                .unwrap_or_default(),
+            "example: page=1",
+        )),
+        Tab::Body => match state.body_mode {
+            BodyMode::Json => Some(PopupState::text(
+                PopupTarget::BodyJson,
+                "Edit JSON Body",
+                state.body_json.clone(),
+                "paste JSON payload",
+            )),
+            BodyMode::Form => Some(PopupState::text(
+                PopupTarget::BodyForm,
+                "Edit Multipart Field",
+                state
+                    .body_form
+                    .get(state.body_form_index)
+                    .cloned()
+                    .unwrap_or_default(),
+                "example: file=@avatar.png",
+            )),
+            BodyMode::Raw => Some(PopupState::text(
+                PopupTarget::BodyRaw,
+                "Edit Raw Body",
+                state.body_raw.clone(),
+                "paste raw request payload",
+            )),
+        },
+        Tab::Basic if BASIC_FIELDS[state.basic_index] == BasicField::Method => {
+            Some(PopupState::choice(
+                PopupTarget::Method,
+                "Select Method",
+                METHOD_SUGGESTIONS
+                    .iter()
+                    .map(|item| (*item).to_owned())
+                    .collect(),
+                state.method.clone(),
+                "Up/Down choose method",
+            ))
+        }
+        _ => None,
+    };
+
+    if let Some(popup) = popup {
+        state.popup = Some(popup);
+        true
+    } else {
+        false
+    }
+}
+
+fn apply_popup_value(state: &mut InteractiveState) -> Result<(), AppError> {
+    let Some(popup) = state.popup.take() else {
+        return Ok(());
+    };
+
+    match popup.target {
+        PopupTarget::Header => apply_header_entry(state, popup.value()),
+        PopupTarget::Param => apply_param_entry(state, popup.value()),
+        PopupTarget::BodyJson => {
+            state.body_mode = BodyMode::Json;
+            state.body_json = popup.value();
+            state.active_tab = Tab::Body;
+            state.status_line = String::from("json payload updated");
+            state.last_error = None;
+        }
+        PopupTarget::BodyForm => apply_body_form_entry(state, popup.value()),
+        PopupTarget::BodyRaw => {
+            apply_body_raw_entry(state, popup.value());
+        }
+        PopupTarget::Method => {
+            state.method = popup.value().to_ascii_uppercase();
+            state.active_tab = Tab::Basic;
+            state.status_line = format!("method set to {}", state.method);
+            state.last_error = None;
+        }
+    }
+
+    sync_command_from_selection(state);
+    Ok(())
 }
 
 fn execute_command_line(state: &mut InteractiveState) -> Result<bool, AppError> {
@@ -757,15 +1034,11 @@ fn apply_input_command(state: &mut InteractiveState, raw: &str) -> Result<(), Ap
         return Ok(());
     }
     if let Some(value) = parse_prefixed_value(raw, &["-d", "--data"]) {
-        apply_body_data_entry(state, value);
+        apply_body_raw_entry(state, value);
         return Ok(());
     }
     if let Some(value) = parse_prefixed_value(raw, &["--data-raw"]) {
-        state.body_mode = BodyMode::Raw;
-        state.body_raw = value;
-        state.active_tab = Tab::Body;
-        state.status_line = String::from("raw payload updated");
-        state.last_error = None;
+        apply_body_raw_entry(state, value);
         return Ok(());
     }
     if let Some(value) = parse_prefixed_value(raw, &["--json"]) {
@@ -849,9 +1122,7 @@ fn apply_cli_matches(state: &mut InteractiveState, raw: &str) -> Result<(), AppE
             }
             state.active_tab = Tab::Params;
         } else {
-            for entry in parsed.data {
-                apply_body_data_entry(state, entry);
-            }
+            apply_body_raw_entry(state, parsed.data.join("&"));
         }
     }
     if matches.contains_id("user_agent") {
@@ -959,20 +1230,11 @@ fn apply_header_entry(state: &mut InteractiveState, value: String) {
     state.last_error = None;
 }
 
-fn apply_body_data_entry(state: &mut InteractiveState, value: String) {
-    state.body_mode = BodyMode::Data;
-    if state.body_data.is_empty() {
-        state.body_data.push(value);
-        state.body_data_index = 0;
-    } else if state.active_tab == Tab::Body {
-        let index = state.body_data_index.min(state.body_data.len() - 1);
-        state.body_data[index] = value;
-    } else {
-        state.body_data.push(value);
-        state.body_data_index = state.body_data.len() - 1;
-    }
+fn apply_body_raw_entry(state: &mut InteractiveState, value: String) {
+    state.body_mode = BodyMode::Raw;
+    state.body_raw = value;
     state.active_tab = Tab::Body;
-    state.status_line = String::from("request data updated");
+    state.status_line = String::from("raw payload updated");
     state.last_error = None;
 }
 
@@ -1104,7 +1366,6 @@ fn move_selection_up(state: &mut InteractiveState) {
         Tab::Basic => state.basic_index = state.basic_index.saturating_sub(1),
         Tab::Headers => state.header_index = state.header_index.saturating_sub(1),
         Tab::Body => match state.body_mode {
-            BodyMode::Data => state.body_data_index = state.body_data_index.saturating_sub(1),
             BodyMode::Form => state.body_form_index = state.body_form_index.saturating_sub(1),
             BodyMode::Json | BodyMode::Raw => {}
         },
@@ -1128,12 +1389,6 @@ fn move_selection_down(state: &mut InteractiveState) {
             }
         }
         Tab::Body => match state.body_mode {
-            BodyMode::Data => {
-                if !state.body_data.is_empty() {
-                    state.body_data_index =
-                        (state.body_data_index + 1).min(state.body_data.len() - 1);
-                }
-            }
             BodyMode::Form => {
                 if !state.body_form.is_empty() {
                     state.body_form_index =
@@ -1163,7 +1418,6 @@ fn delete_selected_item(state: &mut InteractiveState) {
         Tab::Headers => remove_selected(&mut state.headers, &mut state.header_index),
         Tab::Params => remove_selected(&mut state.params, &mut state.param_index),
         Tab::Body => match state.body_mode {
-            BodyMode::Data => remove_selected(&mut state.body_data, &mut state.body_data_index),
             BodyMode::Form => remove_selected(&mut state.body_form, &mut state.body_form_index),
             BodyMode::Json => state.body_json.clear(),
             BodyMode::Raw => state.body_raw.clear(),
@@ -1206,15 +1460,11 @@ fn selection_command(state: &InteractiveState) -> Option<String> {
             .get(state.header_index)
             .map(|value| format!("-H \"{}\"", value.replace('"', "\\\""))),
         Tab::Body => match state.body_mode {
-            BodyMode::Data => state
-                .body_data
-                .get(state.body_data_index)
-                .map(|value| format!("-d \"{}\"", value.replace('"', "\\\""))),
+            BodyMode::Json => Some(format!("--json '{}'", state.body_json.replace('\'', "\\'"))),
             BodyMode::Form => state
                 .body_form
                 .get(state.body_form_index)
                 .map(|value| format!("-F \"{}\"", value.replace('"', "\\\""))),
-            BodyMode::Json => Some(format!("--json '{}'", state.body_json.replace('\'', "\\'"))),
             BodyMode::Raw => Some(format!(
                 "--data-raw '{}'",
                 state.body_raw.replace('\'', "\\'")
@@ -1363,32 +1613,20 @@ impl Tab {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum BodyMode {
-    Data,
     Json,
-    Raw,
     Form,
+    Raw,
 }
 
 impl BodyMode {
-    const ALL: [Self; 4] = [Self::Data, Self::Json, Self::Raw, Self::Form];
+    const ALL: [Self; 3] = [Self::Json, Self::Form, Self::Raw];
 
     fn label(self) -> &'static str {
         match self {
-            Self::Data => "data",
             Self::Json => "json",
-            Self::Raw => "raw",
             Self::Form => "form",
+            Self::Raw => "raw",
         }
-    }
-
-    fn next(self) -> Self {
-        let index = Self::ALL.iter().position(|item| *item == self).unwrap_or(0);
-        Self::ALL[(index + 1) % Self::ALL.len()]
-    }
-
-    fn prev(self) -> Self {
-        let index = Self::ALL.iter().position(|item| *item == self).unwrap_or(0);
-        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
     }
 
     fn from_name(value: &str) -> Option<Self> {
@@ -1399,7 +1637,7 @@ impl BodyMode {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Eq, PartialEq)]
 enum BasicField {
     Url,
     Method,
@@ -1481,10 +1719,10 @@ impl TabLayout {
 struct InteractiveState {
     active_tab: Tab,
     tab_layout: TabLayout,
+    focused_pane: PaneFocus,
     body_mode: BodyMode,
     basic_index: usize,
     header_index: usize,
-    body_data_index: usize,
     body_form_index: usize,
     param_index: usize,
     settings_index: usize,
@@ -1510,12 +1748,12 @@ struct InteractiveState {
     fail: bool,
     compressed: bool,
     headers: Vec<String>,
-    body_data: Vec<String>,
     body_form: Vec<String>,
     body_json: String,
     body_raw: String,
     params: Vec<String>,
     response: Option<CapturedResponse>,
+    popup: Option<PopupState>,
 }
 
 impl InteractiveState {
@@ -1530,19 +1768,19 @@ impl InteractiveState {
             BodyMode::Form
         } else if cli.json.is_some() {
             BodyMode::Json
-        } else if !cli.data_raw.is_empty() {
+        } else if !cli.data_raw.is_empty() || !cli.data.is_empty() {
             BodyMode::Raw
         } else {
-            BodyMode::Data
+            BodyMode::Json
         };
 
         let mut state = Self {
             active_tab: Tab::Request,
             tab_layout: TabLayout::Vertical,
+            focused_pane: PaneFocus::Details,
             body_mode,
             basic_index: 0,
             header_index: 0,
-            body_data_index: 0,
             body_form_index: 0,
             param_index: 0,
             settings_index: 0,
@@ -1570,12 +1808,16 @@ impl InteractiveState {
             fail: cli.fail,
             compressed: cli.compressed,
             headers: cli.headers,
-            body_data: cli.data,
             body_form: cli.form,
             body_json: cli.json.unwrap_or_default(),
-            body_raw: cli.data_raw.join("&"),
+            body_raw: if cli.data_raw.is_empty() {
+                cli.data.join("&")
+            } else {
+                cli.data_raw.join("&")
+            },
             params: Vec::new(),
             response: None,
+            popup: None,
         };
 
         if let Some(url) = cli.url.as_deref() {
@@ -1588,13 +1830,13 @@ impl InteractiveState {
     fn build_cli(&self) -> Cli {
         let url = self.build_url_with_params();
         let (data, data_raw, form, json) = match self.body_mode {
-            BodyMode::Data => (cleaned_items(&self.body_data), Vec::new(), Vec::new(), None),
             BodyMode::Json => (
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 optional_text(&self.body_json),
             ),
+            BodyMode::Form => (Vec::new(), Vec::new(), cleaned_items(&self.body_form), None),
             BodyMode::Raw => (
                 Vec::new(),
                 optional_text(&self.body_raw)
@@ -1603,7 +1845,6 @@ impl InteractiveState {
                 Vec::new(),
                 None,
             ),
-            BodyMode::Form => (Vec::new(), Vec::new(), cleaned_items(&self.body_form), None),
         };
 
         Cli {
@@ -1762,6 +2003,97 @@ impl InteractiveState {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PaneFocus {
+    Tabs,
+    Details,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PopupTarget {
+    Header,
+    Param,
+    BodyJson,
+    BodyForm,
+    BodyRaw,
+    Method,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PopupKind {
+    Text,
+    Choice,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PopupState {
+    target: PopupTarget,
+    kind: PopupKind,
+    title: String,
+    hint: String,
+    input: String,
+    cursor: usize,
+    options: Vec<String>,
+    selected_option: usize,
+}
+
+impl PopupState {
+    fn text(target: PopupTarget, title: &str, input: String, hint: &str) -> Self {
+        let cursor = input.len();
+        Self {
+            target,
+            kind: PopupKind::Text,
+            title: title.to_owned(),
+            hint: hint.to_owned(),
+            input,
+            cursor,
+            options: Vec::new(),
+            selected_option: 0,
+        }
+    }
+
+    fn choice(
+        target: PopupTarget,
+        title: &str,
+        options: Vec<String>,
+        current: String,
+        hint: &str,
+    ) -> Self {
+        let selected_option = options
+            .iter()
+            .position(|option| option.eq_ignore_ascii_case(&current))
+            .unwrap_or(0);
+        Self {
+            target,
+            kind: PopupKind::Choice,
+            title: title.to_owned(),
+            hint: hint.to_owned(),
+            input: String::new(),
+            cursor: 0,
+            options,
+            selected_option,
+        }
+    }
+
+    fn value(&self) -> String {
+        match self.kind {
+            PopupKind::Text => self.input.clone(),
+            PopupKind::Choice => self
+                .options
+                .get(self.selected_option)
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    fn height(&self) -> u16 {
+        match self.kind {
+            PopupKind::Text => 5,
+            PopupKind::Choice => (self.options.len() as u16 + 2).clamp(6, 12),
+        }
+    }
+}
+
 fn cleaned_items(items: &[String]) -> Vec<String> {
     items
         .iter()
@@ -1879,5 +2211,109 @@ mod tests {
         let mut state = InteractiveState::from_cli(Cli::parse_from(["mirza", "--interactive"]));
         execute_internal_command(&mut state, "tabs vertical").unwrap();
         assert_eq!(state.tab_layout, TabLayout::Vertical);
+    }
+
+    #[test]
+    fn body_defaults_to_json_mode() {
+        let state = InteractiveState::from_cli(Cli::parse_from(["mirza", "--interactive"]));
+        assert_eq!(state.body_mode, BodyMode::Json);
+    }
+
+    #[test]
+    fn data_flag_maps_into_raw_body_mode() {
+        let mut state = InteractiveState::from_cli(Cli::parse_from(["mirza", "--interactive"]));
+        apply_input_command(&mut state, "-d name=mirza").unwrap();
+        assert_eq!(state.body_mode, BodyMode::Raw);
+        assert_eq!(state.body_raw, "name=mirza");
+    }
+
+    #[test]
+    fn enter_opens_header_popup_for_selected_header() {
+        let mut state = InteractiveState::from_cli(Cli::parse_from(["mirza", "--interactive"]));
+        state.active_tab = Tab::Headers;
+        state.headers = vec![String::from("Accept: application/json")];
+        state.header_index = 0;
+
+        handle_key(&mut state, KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        assert!(matches!(
+            state.popup.as_ref().map(|popup| &popup.target),
+            Some(PopupTarget::Header)
+        ));
+        assert_eq!(
+            state.popup.as_ref().map(|popup| popup.input.as_str()),
+            Some("Accept: application/json")
+        );
+    }
+
+    #[test]
+    fn method_popup_uses_dropdown_choices() {
+        let mut state = InteractiveState::from_cli(Cli::parse_from(["mirza", "--interactive"]));
+        state.active_tab = Tab::Basic;
+        state.basic_index = 1;
+
+        assert!(try_open_editor_popup(&mut state));
+        assert!(matches!(
+            state.popup.as_ref().map(|popup| &popup.kind),
+            Some(PopupKind::Choice)
+        ));
+        assert_eq!(
+            state.popup.as_ref().map(|popup| popup.value()),
+            Some(String::from("GET"))
+        );
+    }
+
+    #[test]
+    fn left_and_right_switch_between_panes() {
+        let mut state = InteractiveState::from_cli(Cli::parse_from(["mirza", "--interactive"]));
+        state.active_tab = Tab::Basic;
+        state.focused_pane = PaneFocus::Details;
+
+        handle_key(&mut state, KeyEvent::from(KeyCode::Right)).unwrap();
+        assert_eq!(state.focused_pane, PaneFocus::Details);
+        assert_eq!(state.active_tab, Tab::Basic);
+
+        handle_key(&mut state, KeyEvent::from(KeyCode::Left)).unwrap();
+        assert_eq!(state.focused_pane, PaneFocus::Tabs);
+        assert_eq!(state.active_tab, Tab::Basic);
+    }
+
+    #[test]
+    fn tab_key_no_longer_changes_active_tab() {
+        let mut state = InteractiveState::from_cli(Cli::parse_from(["mirza", "--interactive"]));
+        state.active_tab = Tab::Basic;
+
+        handle_key(&mut state, KeyEvent::from(KeyCode::Tab)).unwrap();
+
+        assert_eq!(state.active_tab, Tab::Basic);
+    }
+
+    #[test]
+    fn up_and_down_move_between_tabs_when_tab_pane_is_focused() {
+        let mut state = InteractiveState::from_cli(Cli::parse_from(["mirza", "--interactive"]));
+        state.focused_pane = PaneFocus::Tabs;
+        state.active_tab = Tab::Basic;
+
+        handle_key(&mut state, KeyEvent::from(KeyCode::Down)).unwrap();
+        assert_eq!(state.active_tab, Tab::Headers);
+
+        handle_key(&mut state, KeyEvent::from(KeyCode::Up)).unwrap();
+        assert_eq!(state.active_tab, Tab::Basic);
+    }
+
+    #[test]
+    fn up_and_down_move_within_details_when_details_pane_is_focused() {
+        let mut state = InteractiveState::from_cli(Cli::parse_from(["mirza", "--interactive"]));
+        state.focused_pane = PaneFocus::Details;
+        state.active_tab = Tab::Headers;
+        state.headers = vec![String::from("A: 1"), String::from("B: 2")];
+        state.header_index = 0;
+
+        handle_key(&mut state, KeyEvent::from(KeyCode::Down)).unwrap();
+        assert_eq!(state.header_index, 1);
+        assert_eq!(state.active_tab, Tab::Headers);
+
+        handle_key(&mut state, KeyEvent::from(KeyCode::Up)).unwrap();
+        assert_eq!(state.header_index, 0);
     }
 }
